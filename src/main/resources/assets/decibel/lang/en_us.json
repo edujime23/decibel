@@ -1,0 +1,13 @@
+{
+  "itemGroup.decibel": "Example Mod Tab",
+  "block.decibel.example_block": "Example Block",
+  "item.decibel.example_item": "Example Item",
+
+  "decibel.configuration.title": "Decibel Configs",
+  "decibel.configuration.section.decibel.common.toml": "Decibel Configs",
+  "decibel.configuration.section.decibel.common.toml.title": "Decibel Configs",
+  "decibel.configuration.items": "Item List",
+  "decibel.configuration.logDirtBlock": "Log Dirt Block",
+  "decibel.configuration.magicNumberIntroduction": "Magic Number Text",
+  "decibel.configuration.magicNumber": "Magic Number"
+}
