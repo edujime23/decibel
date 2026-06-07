@@ -29,6 +29,16 @@ const HEADER_SIZE: usize                = 512;
 const RING_BUFFER_SIZE: usize           = QUEUE_CAPACITY * SLOT_SIZE;
 const OFFSET_VOXEL_GRID: usize          = HEADER_SIZE + RING_BUFFER_SIZE; // 66,048
 
+unsafe fn read_volatile_u32(mmap: &MmapMut, offset: usize) -> u32 {
+    let ptr = mmap.as_ptr().add(offset) as *const u32;
+    std::ptr::read_volatile(ptr)
+}
+
+unsafe fn write_volatile_u32(mmap: &mut MmapMut, offset: usize, val: u32) {
+    let ptr = mmap.as_mut_ptr().add(offset) as *mut u32;
+    std::ptr::write_volatile(ptr, val);
+}
+
 pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Sender<AudioCommand>) {
     let shm_file_path = Path::new(&shm_path);
     let _tmp_dir = shm_file_path.parent().expect("Invalid SHM path parent directory");
@@ -88,7 +98,7 @@ pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Se
     let mut last_dev_seq = 0u32;
 
     loop {
-        let java_write_seq = LittleEndian::read_u32(&mmap[OFFSET_JAVA_WRITE_SEQ .. OFFSET_JAVA_WRITE_SEQ + 4]);
+        let java_write_seq = unsafe { read_volatile_u32(&mmap, OFFSET_JAVA_WRITE_SEQ) };
 
         if java_write_seq.saturating_sub(local_read_seq) > QUEUE_CAPACITY as u32 {
             local_read_seq = java_write_seq;
@@ -99,32 +109,32 @@ pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Se
         let mut listener_up = [0.0f32; 3];
         let mut category_volumes = [1.0f32; 16];
 
-        let mut ver = LittleEndian::read_u32(&mmap[OFFSET_VER .. OFFSET_VER + 4]);
+        let mut ver = unsafe { read_volatile_u32(&mmap, OFFSET_VER) };
         let mut attempts = 0;
 
         while ver % 2 != 0 && attempts < 100 {
             std::hint::spin_loop();
-            ver = LittleEndian::read_u32(&mmap[OFFSET_VER .. OFFSET_VER + 4]);
+            ver = unsafe { read_volatile_u32(&mmap, OFFSET_VER) };
             attempts += 1;
         }
 
         compiler_fence(Ordering::Acquire);
 
         for idx in 0..3 {
-            listener_pos[idx] = LittleEndian::read_f32(&mmap[12 + idx * 4 .. 16 + idx * 4]);
-            listener_fwd[idx] = LittleEndian::read_f32(&mmap[24 + idx * 4 .. 28 + idx * 4]);
-            listener_up[idx] = LittleEndian::read_f32(&mmap[36 + idx * 4 .. 40 + idx * 4]);
+            listener_pos[idx] = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(12 + idx * 4) as *const f32) };
+            listener_fwd[idx] = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(24 + idx * 4) as *const f32) };
+            listener_up[idx] = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(36 + idx * 4) as *const f32) };
         }
 
         let vol_offset = 48;
         for idx in 0..16 {
-            category_volumes[idx] = LittleEndian::read_f32(&mmap[vol_offset + idx * 4 .. vol_offset + (idx + 1) * 4]);
+            category_volumes[idx] = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(vol_offset + idx * 4) as *const f32) };
         }
 
-        let engine_flags = LittleEndian::read_u32(&mmap[112..116]);
+        let engine_flags = unsafe { read_volatile_u32(&mmap, 112) };
 
         compiler_fence(Ordering::Release);
-        let ver_check = LittleEndian::read_u32(&mmap[OFFSET_VER .. OFFSET_VER + 4]);
+        let ver_check = unsafe { read_volatile_u32(&mmap, OFFSET_VER) };
 
         if ver == ver_check {
             if listener_pos != last_pos
@@ -149,33 +159,44 @@ pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Se
         }
 
         // Check if voxel grid changed
-        let voxel_version = LittleEndian::read_u32(&mmap[OFFSET_VOXEL_GRID_VERSION .. OFFSET_VOXEL_GRID_VERSION + 4]);
+        let voxel_version = unsafe { read_volatile_u32(&mmap, OFFSET_VOXEL_GRID_VERSION) };
         if voxel_version != local_voxel_version {
             local_voxel_version = voxel_version;
 
-            let cx = LittleEndian::read_i32(&mmap[OFFSET_CENTER_X .. OFFSET_CENTER_X + 4]);
-            let cy = LittleEndian::read_i32(&mmap[OFFSET_CENTER_Y .. OFFSET_CENTER_Y + 4]);
-            let cz = LittleEndian::read_i32(&mmap[OFFSET_CENTER_Z .. OFFSET_CENTER_Z + 4]);
+            let cx = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(OFFSET_CENTER_X) as *const i32) };
+            let cy = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(OFFSET_CENTER_Y) as *const i32) };
+            let cz = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(OFFSET_CENTER_Z) as *const i32) };
 
-            // Fix E0308: Use a heap-allocated (Boxed) array to safely hold 256KB without risking stack overflow [1.2.1]
             let mut voxel_bytes = Box::new([0u8; 262144]);
-            voxel_bytes[..].copy_from_slice(&mmap[OFFSET_VOXEL_GRID .. OFFSET_VOXEL_GRID + 262144]);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    mmap.as_ptr().add(OFFSET_VOXEL_GRID),
+                    voxel_bytes.as_mut_ptr(),
+                    262144,
+                );
+            }
 
             let app_state_task = Arc::clone(&app_state);
             tokio::task::spawn_blocking(move || {
                 crate::phonon::rebuild_acoustic_mesh(
                     app_state_task.scene,
                     app_state_task.context,
-                    &*voxel_bytes, // Dereference coercion from Box<[u8; 262144]> to &[u8; 262144] [1.2.1]
+                    &*voxel_bytes,
                     [cx, cy, cz]
                 );
             });
         }
 
-        let dev_seq = LittleEndian::read_u32(&mmap[OFFSET_DEV_SEQ .. OFFSET_DEV_SEQ + 4]);
+        let dev_seq = unsafe { read_volatile_u32(&mmap, OFFSET_DEV_SEQ) };
         if dev_seq != last_dev_seq {
             let mut name_bytes = vec![0u8; 128];
-            name_bytes.copy_from_slice(&mmap[OFFSET_DEV_NAME .. OFFSET_DEV_NAME + 128]);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    mmap.as_ptr().add(OFFSET_DEV_NAME),
+                    name_bytes.as_mut_ptr(),
+                    128,
+                );
+            }
 
             let len = name_bytes.iter().position(|&x| x == 0).unwrap_or(128);
             let dev_name = String::from_utf8_lossy(&name_bytes[..len]).into_owned();
@@ -188,16 +209,16 @@ pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Se
             let slot_index = (local_read_seq as usize) % QUEUE_CAPACITY;
             let offset = HEADER_SIZE + (slot_index * SLOT_SIZE);
 
-            let opcode = LittleEndian::read_u32(&mmap[offset .. offset + 4]);
+            let opcode = unsafe { read_volatile_u32(&mmap, offset) };
 
             if opcode == 0 { // OP_PLAY
-                let uid = LittleEndian::read_u32(&mmap[offset + 4 .. offset + 8]);
-                let x = LittleEndian::read_f32(&mmap[offset + 8 .. offset + 12]);
-                let y = LittleEndian::read_f32(&mmap[offset + 12 .. offset + 16]);
-                let z = LittleEndian::read_f32(&mmap[offset + 16 .. offset + 20]);
-                let volume = LittleEndian::read_f32(&mmap[offset + 20 .. offset + 24]);
-                let pitch = LittleEndian::read_f32(&mmap[offset + 24 .. offset + 28]);
-                let asset_hash = LittleEndian::read_u32(&mmap[offset + 28 .. offset + 32]);
+                let uid = unsafe { read_volatile_u32(&mmap, offset + 4) };
+                let x = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(offset + 8) as *const f32) };
+                let y = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(offset + 12) as *const f32) };
+                let z = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(offset + 16) as *const f32) };
+                let volume = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(offset + 20) as *const f32) };
+                let pitch = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(offset + 24) as *const f32) };
+                let asset_hash = unsafe { read_volatile_u32(&mmap, offset + 28) };
 
                 let is_relative = mmap[offset + 32] != 0;
                 let is_spatial = mmap[offset + 33] != 0;
@@ -214,14 +235,14 @@ pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Se
                     category_id,
                 });
             } else if opcode == 1 { // OP_STOP
-                let uid = LittleEndian::read_u32(&mmap[offset + 4 .. offset + 8]);
+                let uid = unsafe { read_volatile_u32(&mmap, offset + 4) };
                 let _ = tx_cmd.send(AudioCommand::StopSound { uid });
             } else if opcode == 2 { // OP_STOP_ALL
                 let _ = tx_cmd.send(AudioCommand::StopAllSounds);
             }
 
             local_read_seq += 1;
-            LittleEndian::write_u32(&mut mmap[OFFSET_RUST_READ_SEQ .. OFFSET_RUST_READ_SEQ + 4], local_read_seq);
+            unsafe { write_volatile_u32(&mut mmap, OFFSET_RUST_READ_SEQ, local_read_seq) };
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -238,8 +259,8 @@ where
     loop {
         match stream.read(&mut buffer).await {
             Ok(0) => {
-                println!("[Rust Daemon] Signal channel disconnected.");
-                break;
+                println!("[Rust Daemon] Signal channel disconnected. Initiating fast exit.");
+                std::process::exit(0);
             }
             Ok(bytes_read) => {
                 pending_data.extend_from_slice(&buffer[..bytes_read]);
@@ -283,7 +304,7 @@ where
             }
             Err(e) => {
                 eprintln!("[Rust Daemon] IPC read error: {:?}", e);
-                break;
+                std::process::exit(1);
             }
         }
     }

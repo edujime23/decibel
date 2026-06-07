@@ -109,7 +109,6 @@ impl FdnReverb {
             return 0.0;
         }
 
-        // Map T60 decay times directly to delay line feedback coefficients
         let mid_decay = t60[1].max(0.1);
         let feedback_gain: [f32; 4] = [
             ( -60.0 * (DELAY_SIZES[0] as f32 / 48000.0) / mid_decay ).exp2().clamp(0.0, 0.95),
@@ -123,7 +122,6 @@ impl FdnReverb {
             d[i] = self.buffers[i][self.indices[i]];
         }
 
-        // Hadarmard matrix multiplication (unrolls to cheap additions, zero divisions)
         let tmp0 = d[0] + d[1];
         let tmp1 = d[2] + d[3];
         let tmp2 = d[0] - d[1];
@@ -136,14 +134,12 @@ impl FdnReverb {
             0.5 * (tmp2 - tmp3),
         ];
 
-        // Apply lowpass filters to delay loops to simulate frequency-dependent high decay [7.2]
         let high_decay_ratio = (t60[2] / t60[1]).clamp(0.1, 0.9);
         let lpf_coefficient = 1.0 - high_decay_ratio;
 
         for i in 0..4 {
             let output_with_feedback = input + out[i] * feedback_gain[i];
 
-            // 1st order recursive lowpass filter
             self.lowpass_states[i] = self.lowpass_states[i] * lpf_coefficient
                 + output_with_feedback * (1.0 - lpf_coefficient);
 
@@ -151,7 +147,6 @@ impl FdnReverb {
             self.indices[i] = (self.indices[i] + 1) % DELAY_SIZES[i];
         }
 
-        // Blend mixed wet delay components
         (out[0] + out[1] + out[2] + out[3]) * 0.25 * wet_mix
     }
 }
@@ -354,8 +349,8 @@ pub fn run_audio_thread(
                     if let Some(default_dev) = host.default_output_device() {
                         if let Ok(default_name) = default_dev.name() {
                             let mut should_migrate = false;
-                            if let Some(ref cur_name) = current_device_name {
-                                if *cur_name != default_name {
+                            if let Some(ref_name) = &current_device_name {
+                                if *ref_name != default_name {
                                     should_migrate = true;
                                 }
                             } else {
@@ -588,7 +583,9 @@ fn build_stream_result(
                             &mut direct_output
                         );
 
+                        // Call iplCalculateRelativeDirection natively
                         let direction = phonon::get_relative_direction(
+                            app_state.context,
                             sound.pos,
                             listener_pos,
                             listener_fwd,
@@ -625,11 +622,9 @@ fn build_stream_result(
                     i += 1;
                 }
 
-                // Process cave reverberation using the physics-based environmental parameters
+                // Process cave reverberation lock-free using atomic environmental parameters
                 if enable_reverb {
-                    let env = phonon::ACTIVE_ENVIRONMENT.lock().unwrap();
-                    let t60 = env.t60;
-                    let wet_mix = env.wet_mix;
+                    let (t60, wet_mix) = phonon::ACTIVE_ENVIRONMENT.load_relaxed();
 
                     for f in 0..FRAME_SIZE {
                         let wet_l = reverb_l.process(mix_l[f], t60, wet_mix);

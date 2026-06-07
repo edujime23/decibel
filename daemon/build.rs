@@ -7,8 +7,15 @@ fn main() {
     // Re-run this script if any header files change
     println!("cargo:rerun-if-changed={}", include_path.display());
 
-    // Link against the phonon import library for compilation
-    let lib_path = PathBuf::from("../steamaudio/windows/x64");
+    // Link against the phonon library for compilation based on target OS
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "windows".to_string());
+    let lib_path = match target_os.as_str() {
+        "windows" => PathBuf::from("../steamaudio/windows/x64"),
+        "linux" => PathBuf::from("../steamaudio/linux/x64"),
+        "macos" => PathBuf::from("../steamaudio/macos"),
+        _ => PathBuf::from("../steamaudio/windows/x64"),
+    };
+
     println!("cargo:rustc-link-search=native={}", lib_path.display());
     println!("cargo:rustc-link-lib=phonon");
 

@@ -1,9 +1,9 @@
 use crate::steam_audio::*;
 use std::ptr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-// Fix E0277: Thread-safety wrapper for the raw FFI pointer
+// FFI Thread-Safety Wrapper
 #[derive(Copy, Clone)]
 pub struct SendStaticMesh(pub IPLStaticMesh);
 unsafe impl Send for SendStaticMesh {}
@@ -16,29 +16,50 @@ struct SafeMesh {
 }
 
 pub struct EnvironmentAcoustics {
-    pub t60: [f32; 3], // Reverberation decay time (seconds) for [low, mid, high] frequencies
-    pub wet_mix: f32,  // The reverb auxiliary wet send volume
+    pub t60_low: AtomicU32,
+    pub t60_mid: AtomicU32,
+    pub t60_high: AtomicU32,
+    pub wet_mix: AtomicU32,
 }
 
-// Global thread-safe environment tracking
+impl EnvironmentAcoustics {
+    pub const fn new() -> Self {
+        EnvironmentAcoustics {
+            t60_low: AtomicU32::new(0x3dcccccd),  // 0.1 float bits
+            t60_mid: AtomicU32::new(0x3dcccccd),  // 0.1 float bits
+            t60_high: AtomicU32::new(0x3dcccccd), // 0.1 float bits
+            wet_mix: AtomicU32::new(0),           // 0.0 float bits
+        }
+    }
+
+    pub fn load_relaxed(&self) -> ([f32; 3], f32) {
+        let low = f32::from_bits(self.t60_low.load(Ordering::Relaxed));
+        let mid = f32::from_bits(self.t60_mid.load(Ordering::Relaxed));
+        let high = f32::from_bits(self.t60_high.load(Ordering::Relaxed));
+        let wet = f32::from_bits(self.wet_mix.load(Ordering::Relaxed));
+        ([low, mid, high], wet)
+    }
+
+    pub fn store_relaxed(&self, t60: [f32; 3], wet_mix: f32) {
+        self.t60_low.store(t60[0].to_bits(), Ordering::Relaxed);
+        self.t60_mid.store(t60[1].to_bits(), Ordering::Relaxed);
+        self.t60_high.store(t60[2].to_bits(), Ordering::Relaxed);
+        self.wet_mix.store(wet_mix.to_bits(), Ordering::Relaxed);
+    }
+}
+
+// Global thread-safe lock-free environment tracking
 static ACTIVE_STATIC_MESH: Mutex<Option<SendStaticMesh>> = Mutex::new(None);
 static ACTIVE_SAFE_MESH: Mutex<Option<SafeMesh>> = Mutex::new(None);
-pub static ACTIVE_ENVIRONMENT: Mutex<EnvironmentAcoustics> = Mutex::new(EnvironmentAcoustics {
-    t60: [0.1, 0.1, 0.1],
-    wet_mix: 0.0,
-});
+pub static ACTIVE_ENVIRONMENT: EnvironmentAcoustics = EnvironmentAcoustics::new();
 
 pub static IS_SCENE_COMMITTING: AtomicBool = AtomicBool::new(false);
 
 const ACOUSTIC_MATERIALS: [IPLMaterial; 5] = [
     IPLMaterial { absorption: [0.0; 3], scattering: 0.0, transmission: [1.0; 3] },
-    // STONE [7.2]
     IPLMaterial { absorption: [0.05, 0.05, 0.05], scattering: 0.1, transmission: [0.01, 0.01, 0.01] },
-    // WOOD [7.2]
     IPLMaterial { absorption: [0.10, 0.20, 0.30], scattering: 0.5, transmission: [0.10, 0.05, 0.02] },
-    // WOOL [7.2]
     IPLMaterial { absorption: [0.60, 0.80, 0.95], scattering: 0.8, transmission: [0.20, 0.05, 0.01] },
-    // GLASS [7.2]
     IPLMaterial { absorption: [0.02, 0.02, 0.05], scattering: 0.05, transmission: [0.60, 0.40, 0.20] },
 ];
 
@@ -56,9 +77,7 @@ impl SteamDirectEffect {
             samplingRate: sample_rate,
             frameSize: frame_size,
         };
-        let mut effect_settings = IPLDirectEffectSettings {
-            numChannels: 1,
-        };
+        let mut effect_settings = IPLDirectEffectSettings { numChannels: 1 };
 
         unsafe {
             let status = iplDirectEffectCreate(context, &mut audio_settings, &mut effect_settings, &mut effect);
@@ -144,9 +163,7 @@ impl SteamBinauralEffect {
             samplingRate: sample_rate,
             frameSize: frame_size,
         };
-        let mut effect_settings = IPLBinauralEffectSettings {
-            hrtf,
-        };
+        let mut effect_settings = IPLBinauralEffectSettings { hrtf };
 
         unsafe {
             let status = iplBinauralEffectCreate(context, &mut audio_settings, &mut effect_settings, &mut effect);
@@ -202,49 +219,20 @@ impl Drop for SteamBinauralEffect {
 }
 
 pub fn get_relative_direction(
+    context: IPLContext,
     source_pos: [f32; 3],
     listener_pos: [f32; 3],
     listener_fwd: [f32; 3],
     listener_up: [f32; 3],
 ) -> IPLVector3 {
-    let t = [
-        source_pos[0] - listener_pos[0],
-        source_pos[1] - listener_pos[1],
-        source_pos[2] - listener_pos[2],
-    ];
+    let source = IPLVector3 { x: source_pos[0], y: source_pos[1], z: source_pos[2] };
+    let listener = IPLVector3 { x: listener_pos[0], y: listener_pos[1], z: listener_pos[2] };
+    let ahead = IPLVector3 { x: listener_fwd[0], y: listener_fwd[1], z: listener_fwd[2] };
+    let up = IPLVector3 { x: listener_up[0], y: listener_up[1], z: listener_up[2] };
 
-    let norm_fwd = normalize(listener_fwd);
-    let norm_up = normalize(listener_up);
-
-    let r = cross(norm_fwd, norm_up);
-    let norm_r = normalize(r);
-
-    let x_local = dot(t, norm_r);
-    let y_local = dot(t, norm_up);
-    let z_local = -dot(t, norm_fwd);
-
-    IPLVector3 { x: x_local, y: y_local, z: z_local }
-}
-
-fn normalize(v: [f32; 3]) -> [f32; 3] {
-    let len = (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt();
-    if len < 1e-6 {
-        v
-    } else {
-        [v[0]/len, v[1]/len, v[2]/len]
+    unsafe {
+        iplCalculateRelativeDirection(context, source, listener, ahead, up)
     }
-}
-
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1]*b[2] - a[2]*b[1],
-        a[2]*b[0] - a[0]*b[2],
-        a[0]*b[1] - a[1]*b[0],
-    ]
-}
-
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
 }
 
 fn make_vector(d: usize, u: usize, v: usize, cd: f32, cu: f32, cv: f32, center: [i32; 3]) -> IPLVector3 {
@@ -386,7 +374,7 @@ pub fn calculate_occlusion_and_transmission(
 pub fn rebuild_acoustic_mesh(
     scene: IPLScene,
     _context: IPLContext,
-    voxels: &[u8; 262144], // Scaled to support full 64x64x64 envelope [7.1]
+    voxels: &[u8; 262144],
     center: [i32; 3]
 ) {
     let mut vertices: Vec<IPLVector3> = Vec::new();
@@ -415,7 +403,7 @@ pub fn rebuild_acoustic_mesh(
                         let current_val = voxels[idx];
 
                         if current_val == 0 {
-                            if d == 0 { air_blocks += 1.0 / 3.0; } // avoid triple counting across 3 dimension sweeps
+                            if d == 0 { air_blocks += 1.0 / 3.0; }
                         } else if current_val == 1 {
                             if d == 0 { stone_blocks += 1.0 / 3.0; }
                         }
@@ -543,7 +531,6 @@ pub fn rebuild_acoustic_mesh(
 
             let mesh_ref = (*safe_mesh_lock).as_ref().unwrap();
 
-            // Calculate exact physical cave reverberation parameters using Sabine's architectural formula
             let mut total_area = 0.0f32;
             let mut weighted_absorption = 0.0f32;
 
@@ -574,43 +561,39 @@ pub fn rebuild_acoustic_mesh(
             }
 
             let avg_abs = if total_area > 0.1 { weighted_absorption / total_area } else { 0.15f32 };
-            let room_volume = air_blocks; // Each block corresponds to exactly 1.0 m^3
+            let room_volume = air_blocks;
 
-            // Sabine's Formula: T60 = 0.161 * V / (A * a + leakage_factor)
-            let leakage = 10.0f32; // Simulates open portal sound leakage to prevent infinite reverb tails
+            let leakage = 10.0f32;
             let base_t60 = (0.161f32 * room_volume) / (total_area * avg_abs + leakage);
 
-            // Map the frequency absorption decay bands [Low, Mid, High]
             let low_decay = base_t60 * 1.5;
             let mid_decay = base_t60;
-            let high_decay = base_t60 * 0.5; // High frequencies decay twice as fast due to air absorption
+            let high_decay = base_t60 * 0.5;
 
             let stone_ratio = stone_blocks / 262144.0;
-            let is_underground = stone_ratio > 0.4; // Threshold determining if listener is enclosed in a cave
+            let is_underground = stone_ratio > 0.4;
 
-            let mut env_lock = ACTIVE_ENVIRONMENT.lock().unwrap();
             if is_underground && room_volume > 1000.0 {
-                env_lock.t60 = [
+                let t60 = [
                     low_decay.clamp(0.2, 5.0),
                     mid_decay.clamp(0.2, 4.0),
                     high_decay.clamp(0.1, 2.0),
                 ];
-                // Increase wet reverb blend based on underground cavity depth
-                env_lock.wet_mix = (stone_ratio * 2.0).clamp(0.0, 0.4);
+                let wet_mix = (stone_ratio * 2.0).clamp(0.0, 0.4);
+                ACTIVE_ENVIRONMENT.store_relaxed(t60, wet_mix);
             } else {
-                // Outdoor/Overworld dampening profile (extremely dry, dead echoes)
-                env_lock.t60 = [0.1, 0.1, 0.1];
-                env_lock.wet_mix = 0.0;
+                ACTIVE_ENVIRONMENT.store_relaxed([0.1, 0.1, 0.1], 0.0);
             }
 
+            let loaded_env = ACTIVE_ENVIRONMENT.load_relaxed();
             println!(
                 "[Rust Daemon] Meshing committed. Triangles: {}, Est. Volume: {} m3, T60: [{:.2}s, {:.2}s, {:.2}s], Wet Send: {:.1}%",
                 mesh_ref.triangles.len(),
                 room_volume as u32,
-                env_lock.t60[0],
-                env_lock.t60[1],
-                env_lock.t60[2],
-                env_lock.wet_mix * 100.0
+                loaded_env.0[0],
+                loaded_env.0[1],
+                loaded_env.0[2],
+                loaded_env.1 * 100.0
             );
         } else {
             eprintln!("[Rust Daemon] Failed to compile static mesh: Status {}", status);
