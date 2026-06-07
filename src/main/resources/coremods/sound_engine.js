@@ -80,7 +80,7 @@ function initializeCoreMod() {
             'target': {
                 'type': 'METHOD',
                 'class': 'net.minecraft.client.sounds.SoundEngine',
-                'methodName': 'updateSource', // Fixed method name
+                'methodName': 'updateSource',
                 'methodDesc': '(Lnet/minecraft/client/Camera;)V'
             },
             'transformer': function(methodNode) {
@@ -98,6 +98,60 @@ function initializeCoreMod() {
                     "com/edujime23/decibel/asm/SoundInterceptor",
                     "onUpdateListener",
                     "(Lnet/minecraft/client/Camera;)V",
+                    false
+                ));
+
+                methodNode.instructions.insert(instructions);
+                return methodNode;
+            }
+        },
+        'decibel_sound_stop_all': {
+            'target': {
+                'type': 'METHOD',
+                'class': 'net.minecraft.client.sounds.SoundEngine',
+                'methodName': 'stopAll',
+                'methodDesc': '()V'
+            },
+            'transformer': function(methodNode) {
+                var Opcodes = Java.type('org.objectweb.asm.Opcodes');
+                var MethodInsnNode = Java.type('org.objectweb.asm.tree.MethodInsnNode');
+                var InsnList = Java.type('org.objectweb.asm.tree.InsnList');
+
+                print("[Decibel CoreMod] Splicing net.minecraft.client.sounds.SoundEngine.stopAll()...");
+
+                var instructions = new InsnList();
+                instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "com/edujime23/decibel/asm/SoundInterceptor",
+                    "onStopAll",
+                    "()V",
+                    false
+                ));
+
+                methodNode.instructions.insert(instructions);
+                return methodNode;
+            }
+        },
+        'decibel_sound_destroy': {
+            'target': {
+                'type': 'METHOD',
+                'class': 'net.minecraft.client.sounds.SoundEngine',
+                'methodName': 'destroy',
+                'methodDesc': '()V'
+            },
+            'transformer': function(methodNode) {
+                var Opcodes = Java.type('org.objectweb.asm.Opcodes');
+                var MethodInsnNode = Java.type('org.objectweb.asm.tree.MethodInsnNode');
+                var InsnList = Java.type('org.objectweb.asm.tree.InsnList');
+
+                print("[Decibel CoreMod] Splicing net.minecraft.client.sounds.SoundEngine.destroy()...");
+
+                var instructions = new InsnList();
+                instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "com/edujime23/decibel/asm/SoundInterceptor",
+                    "onStopAll",
+                    "()V",
                     false
                 ));
 

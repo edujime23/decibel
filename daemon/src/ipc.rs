@@ -12,11 +12,11 @@ use crate::asset;
 
 const QUEUE_CAPACITY: usize = 1024;
 const SLOT_SIZE: usize = 64;
-const HEADER_SIZE: usize = 64;
+const HEADER_SIZE: usize = 256;
 
 pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: Sender<AudioCommand>) {
     let shm_file_path = Path::new(&shm_path);
-    let tmp_dir = shm_file_path.parent().expect("Invalid SHM path parent directory");
+    let _tmp_dir = shm_file_path.parent().expect("Invalid SHM path parent directory");
 
     let file = OpenOptions::new()
         .read(true)
@@ -28,7 +28,7 @@ pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: S
     let tx_cmd_clone = tx_cmd.clone();
 
     #[cfg(unix)]
-    let tmp_dir_clone = tmp_dir.to_path_buf();
+    let tmp_dir_clone = _tmp_dir.to_path_buf();
 
     tokio::spawn(async move {
         #[cfg(windows)]
@@ -64,10 +64,12 @@ pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: S
     println!("[Rust Daemon] SHM Control Loop active.");
     let mut local_read_seq = 0;
 
-    // Track state to prevent blasting 1000 identical coordinate commands per second
     let mut last_pos = [0.0f32; 3];
     let mut last_fwd = [0.0f32; 3];
     let mut last_up = [0.0f32; 3];
+    let mut last_category_volumes = [1.0f32; 16];
+    let mut last_engine_flags = 0u32;
+    let mut last_dev_seq = 0u32;
 
     loop {
         let java_write_seq = LittleEndian::read_u32(&mmap[0..4]);
@@ -79,23 +81,64 @@ pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: S
         let mut listener_pos = [0.0f32; 3];
         let mut listener_fwd = [0.0f32; 3];
         let mut listener_up = [0.0f32; 3];
+        let mut category_volumes = [1.0f32; 16];
 
-        for idx in 0..3 {
-            listener_pos[idx] = LittleEndian::read_f32(&mmap[8 + idx * 4 .. 12 + idx * 4]);
-            listener_fwd[idx] = LittleEndian::read_f32(&mmap[20 + idx * 4 .. 24 + idx * 4]);
-            listener_up[idx] = LittleEndian::read_f32(&mmap[32 + idx * 4 .. 36 + idx * 4]);
+        let mut ver = LittleEndian::read_u32(&mmap[8..12]);
+        let mut attempts = 0;
+
+        while ver % 2 != 0 && attempts < 100 {
+            std::hint::spin_loop();
+            ver = LittleEndian::read_u32(&mmap[8..12]);
+            attempts += 1;
         }
 
-        // Only send updates if coordinates or orientation have changed
-        if listener_pos != last_pos || listener_fwd != last_fwd || listener_up != last_up {
-            let _ = tx_cmd.send(AudioCommand::UpdateListener {
-                pos: listener_pos,
-                fwd: listener_fwd,
-                up: listener_up,
-            });
-            last_pos = listener_pos;
-            last_fwd = listener_fwd;
-            last_up = listener_up;
+        for idx in 0..3 {
+            listener_pos[idx] = LittleEndian::read_f32(&mmap[12 + idx * 4 .. 16 + idx * 4]);
+            listener_fwd[idx] = LittleEndian::read_f32(&mmap[24 + idx * 4 .. 28 + idx * 4]);
+            listener_up[idx] = LittleEndian::read_f32(&mmap[36 + idx * 4 .. 40 + idx * 4]);
+        }
+
+        let vol_offset = 48;
+        for idx in 0..16 {
+            category_volumes[idx] = LittleEndian::read_f32(&mmap[vol_offset + idx * 4 .. vol_offset + (idx + 1) * 4]);
+        }
+
+        let engine_flags = LittleEndian::read_u32(&mmap[112..116]);
+
+        let ver_check = LittleEndian::read_u32(&mmap[8..12]);
+
+        if ver == ver_check {
+            if listener_pos != last_pos
+                || listener_fwd != last_fwd
+                || listener_up != last_up
+                || category_volumes != last_category_volumes
+                || engine_flags != last_engine_flags
+            {
+                let _ = tx_cmd.send(AudioCommand::UpdateListener {
+                    pos: listener_pos,
+                    fwd: listener_fwd,
+                    up: listener_up,
+                    category_volumes,
+                    engine_flags,
+                });
+                last_pos = listener_pos;
+                last_fwd = listener_fwd;
+                last_up = listener_up;
+                last_category_volumes = category_volumes;
+                last_engine_flags = engine_flags;
+            }
+        }
+
+        let dev_seq = LittleEndian::read_u32(&mmap[116..120]);
+        if dev_seq != last_dev_seq {
+            let mut name_bytes = vec![0u8; 128];
+            name_bytes.copy_from_slice(&mmap[120..248]);
+
+            let len = name_bytes.iter().position(|&x| x == 0).unwrap_or(128);
+            let dev_name = String::from_utf8_lossy(&name_bytes[..len]).into_owned();
+
+            let _ = tx_cmd.send(AudioCommand::ChangeDevice { name: dev_name });
+            last_dev_seq = dev_seq;
         }
 
         while local_read_seq < java_write_seq {
@@ -115,6 +158,7 @@ pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: S
 
                 let is_relative = mmap[offset + 32] != 0;
                 let is_spatial = mmap[offset + 33] != 0;
+                let category_id = mmap[offset + 34] as usize;
 
                 let _ = tx_cmd.send(AudioCommand::PlaySound {
                     uid,
@@ -124,10 +168,13 @@ pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: S
                     asset_hash,
                     is_relative,
                     is_spatial,
+                    category_id,
                 });
             } else if opcode == 1 { // OP_STOP
                 let uid = LittleEndian::read_u32(&mmap[offset + 4 .. offset + 8]);
                 let _ = tx_cmd.send(AudioCommand::StopSound { uid });
+            } else if opcode == 2 { // OP_STOP_ALL
+                let _ = tx_cmd.send(AudioCommand::StopAllSounds);
             }
 
             local_read_seq += 1;
@@ -175,7 +222,6 @@ where
                         println!("[Rust Daemon] Streamed asset received for hash: {}", hash);
 
                         let tx_cmd_task = tx_cmd.clone();
-                        // Offload heavy OGG synchronous decoding to background blocking thread pool
                         tokio::task::spawn_blocking(move || {
                             match asset::decode_ogg_in_memory(payload) {
                                 Ok(pcm_asset) => {

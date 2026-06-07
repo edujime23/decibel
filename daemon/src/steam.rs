@@ -5,8 +5,6 @@ pub struct SteamDirectEffect {
     effect: IPLDirectEffect,
 }
 
-// Explicitly mark raw pointer wrappers as thread-safe since they are strictly
-// owned and mutated by a single active sound pipeline inside the CPAL thread.
 unsafe impl Send for SteamDirectEffect {}
 unsafe impl Sync for SteamDirectEffect {}
 
@@ -35,6 +33,9 @@ impl SteamDirectEffect {
         input_channel: &[f32],
         distance_attenuation: f32,
         air_absorption: [f32; 3],
+        flags_bitmask: u32,
+        occlusion: f32,
+        transmission: [f32; 3],
         out_channel: &mut [f32],
     ) {
         let mut input_data = input_channel.as_ptr() as *mut f32;
@@ -51,15 +52,27 @@ impl SteamDirectEffect {
             data: &mut out_data,
         };
 
+        let mut effect_flags = IPLDirectEffectFlags_IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION
+            | IPLDirectEffectFlags_IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION;
+
+        let enable_occlusion = (flags_bitmask & (1 << 2)) != 0;
+        let enable_transmission = (flags_bitmask & (1 << 3)) != 0;
+
+        if enable_occlusion {
+            effect_flags |= IPLDirectEffectFlags_IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION;
+        }
+        if enable_transmission {
+            effect_flags |= IPLDirectEffectFlags_IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION;
+        }
+
         let mut params = IPLDirectEffectParams {
-            flags: IPLDirectEffectFlags_IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION
-                | IPLDirectEffectFlags_IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION,
+            flags: effect_flags,
             transmissionType: IPLTransmissionType_IPL_TRANSMISSIONTYPE_FREQDEPENDENT,
             distanceAttenuation: distance_attenuation,
             airAbsorption: air_absorption,
             directivity: 0.0,
-            occlusion: 0.0,
-            transmission: [1.0, 1.0, 1.0], // Correct field mappings for Steam Audio v4
+            occlusion,
+            transmission,
         };
 
         unsafe {
@@ -130,7 +143,7 @@ impl SteamBinauralEffect {
             interpolation: IPLHRTFInterpolation_IPL_HRTFINTERPOLATION_NEAREST,
             spatialBlend: 1.0,
             hrtf,
-            peakDelays: std::ptr::null_mut(), // Added missing peakDelays pointer initialisation
+            peakDelays: std::ptr::null_mut(),
         };
 
         unsafe {

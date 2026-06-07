@@ -1,42 +1,41 @@
 package com.edujime23.decibel;
 
-import java.util.List;
-import java.util.Set;
-import java.util.stream.Collectors;
-
-import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.resources.ResourceLocation;
-import net.minecraft.world.item.Item;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.fml.event.config.ModConfigEvent;
 import net.neoforged.neoforge.common.ModConfigSpec;
+import java.util.List;
 
-// An example config class. This is not required, but it's a good idea to have one to keep your config organized.
-// Demonstrates how to use Neo's config APIs
 public class Config {
-    private static final ModConfigSpec.Builder BUILDER = new ModConfigSpec.Builder();
+    public static final ModConfigSpec SPEC;
 
-    public static final ModConfigSpec.BooleanValue LOG_DIRT_BLOCK = BUILDER
-            .comment("Whether to log the dirt block on common setup")
-            .define("logDirtBlock", true);
+    public static final ModConfigSpec.BooleanValue LOG_DIRT_BLOCK;
+    public static final ModConfigSpec.ConfigValue<String> MAGIC_NUMBER_INTRODUCTION;
+    public static final ModConfigSpec.IntValue MAGIC_NUMBER;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> ITEM_STRINGS;
 
-    public static final ModConfigSpec.IntValue MAGIC_NUMBER = BUILDER
-            .comment("A magic number")
-            .defineInRange("magicNumber", 42, 0, Integer.MAX_VALUE);
+    // Steam Audio Feature Option Toggles
+    public static final ModConfigSpec.BooleanValue ENABLE_STEAM_AUDIO;
+    public static final ModConfigSpec.BooleanValue ENABLE_OCCLUSION;
+    public static final ModConfigSpec.BooleanValue ENABLE_TRANSMISSION;
+    public static final ModConfigSpec.BooleanValue ENABLE_REVERB;
+    public static final ModConfigSpec.BooleanValue ENABLE_REFLECTION;
 
-    public static final ModConfigSpec.ConfigValue<String> MAGIC_NUMBER_INTRODUCTION = BUILDER
-            .comment("What you want the introduction message to be for the magic number")
-            .define("magicNumberIntroduction", "The magic number is... ");
+    static {
+        ModConfigSpec.Builder builder = new ModConfigSpec.Builder();
 
-    // a list of strings that are treated as resource locations for items
-    public static final ModConfigSpec.ConfigValue<List<? extends String>> ITEM_STRINGS = BUILDER
-            .comment("A list of items to log on common setup.")
-            .defineListAllowEmpty("items", List.of("minecraft:iron_ingot"), () -> "", Config::validateItemName);
+        builder.push("general");
+        LOG_DIRT_BLOCK = builder.comment("Whether to log dirt block info").define("logDirtBlock", true);
+        MAGIC_NUMBER_INTRODUCTION = builder.comment("Magic number introduction").define("magicNumberIntroduction", "The magic number is... ");
+        MAGIC_NUMBER = builder.comment("A magic number").defineInRange("magicNumber", 42, 0, 100);
+        ITEM_STRINGS = builder.comment("A list of items").defineListAllowEmpty("items", List.of("minecraft:iron_ingot"), (obj) -> obj instanceof String);
+        builder.pop();
 
-    static final ModConfigSpec SPEC = BUILDER.build();
+        builder.push("steam_audio_settings");
+        ENABLE_STEAM_AUDIO = builder.comment("Enable or disable dynamic Steam Audio rendering globally.").define("enableSteamAudio", true);
+        ENABLE_OCCLUSION = builder.comment("Enable or disable sound occlusion calculations behind solid geometry.").define("enableOcclusion", true);
+        ENABLE_TRANSMISSION = builder.comment("Enable or disable sound transmission (sounds passing through solid walls).").define("enableTransmission", true);
+        ENABLE_REVERB = builder.comment("Enable or disable physics-based environmental reverberation.").define("enableReverb", true);
+        ENABLE_REFLECTION = builder.comment("Enable or disable real-time acoustic reflections/echoes.").define("enableReflection", true);
+        builder.pop();
 
-    private static boolean validateItemName(final Object obj) {
-        return obj instanceof String itemName && BuiltInRegistries.ITEM.containsKey(ResourceLocation.parse(itemName));
+        SPEC = builder.build();
     }
 }

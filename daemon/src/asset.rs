@@ -2,6 +2,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 use lewton::inside_ogg::OggStreamReader;
 
+#[derive(Clone)]
 pub struct PCMAsset {
     pub pcm: Arc<Vec<f32>>,
     pub channels: u16,

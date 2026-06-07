@@ -7,9 +7,8 @@ use std::env;
 use std::sync::Arc;
 use std::thread;
 use crossbeam_channel::unbounded;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait}; // Removed StreamTrait
 
-// Auto-generated Steam Audio Bindings
 #[allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
 pub mod steam_audio {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
@@ -69,7 +68,6 @@ async fn main() {
     let device = host.default_output_device().expect("No output device found!");
     let config = device.default_output_config().expect("Failed to get config!");
 
-    // LOCK Strictly to 48000 Hz internally to guarantee built-in HRTF compatibility
     let mut audio_settings = steam_audio::IPLAudioSettings {
         samplingRate: 48000,
         frameSize: 512,

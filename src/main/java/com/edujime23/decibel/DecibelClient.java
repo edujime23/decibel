@@ -13,6 +13,9 @@ public class DecibelClient {
     public DecibelClient(ModContainer container) {
         container.registerExtensionPoint(IConfigScreenFactory.class, ConfigurationScreen::new);
         container.getEventBus().addListener(this::onClientSetup);
+
+        // Register the client tick handler to synchronize state in menus
+        net.neoforged.neoforge.common.NeoForge.EVENT_BUS.register(ClientTickHandler.class);
     }
 
     private void onClientSetup(FMLClientSetupEvent event) {
