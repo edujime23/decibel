@@ -38,3 +38,15 @@ run/
 **/src/generated/**/.cache/
 repo/
 !**/src/**/repo/
+
+### Phonon Lib files
+steamaudio/windows/x64/
+steamaudio/windows/x64/
+steamaudio/linux/x64/
+steamaudio/macos/x64/
+steamaudio/macos/x64/phonon.bundle/
+
+
+### Rust
+/daemon/target/
+/src/main/resources/bin/

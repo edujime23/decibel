@@ -1,0 +1,15 @@
+[package]
+name = "daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memmap2 = "0.9"
+byteorder = "1.5"
+cpal = "0.15"
+lewton = "0.10"
+tokio = { version = "1", features = ["full", "net", "io-util"] }
+crossbeam-channel = "0.5"
+
+[build-dependencies]
+bindgen = "0.69"
