@@ -9,31 +9,36 @@ pub struct SendStaticMesh(pub IPLStaticMesh);
 unsafe impl Send for SendStaticMesh {}
 unsafe impl Sync for SendStaticMesh {}
 
-// Safe Rust mirror of the active scene geometry for fast local raycasting
 struct SafeMesh {
     vertices: Vec<IPLVector3>,
     triangles: Vec<IPLTriangle>,
     materials: Vec<i32>,
 }
 
-// Global thread-safe tracking of the dynamic physical mesh structure in Phonon
+pub struct EnvironmentAcoustics {
+    pub t60: [f32; 3], // Reverberation decay time (seconds) for [low, mid, high] frequencies
+    pub wet_mix: f32,  // The reverb auxiliary wet send volume
+}
+
+// Global thread-safe environment tracking
 static ACTIVE_STATIC_MESH: Mutex<Option<SendStaticMesh>> = Mutex::new(None);
 static ACTIVE_SAFE_MESH: Mutex<Option<SafeMesh>> = Mutex::new(None);
+pub static ACTIVE_ENVIRONMENT: Mutex<EnvironmentAcoustics> = Mutex::new(EnvironmentAcoustics {
+    t60: [0.1, 0.1, 0.1],
+    wet_mix: 0.0,
+});
 
-// Lock-free atomic barrier preventing CPAL raycast queries during scene BVH commits [6.2]
 pub static IS_SCENE_COMMITTING: AtomicBool = AtomicBool::new(false);
 
-// Predefined frequency-dependent acoustic material structures for Minecraft profiles [7.2]
 const ACOUSTIC_MATERIALS: [IPLMaterial; 5] = [
-    // Index 0: AIR (unused)
     IPLMaterial { absorption: [0.0; 3], scattering: 0.0, transmission: [1.0; 3] },
-    // Index 1: STONE / COBBLE / METALS (Reflective) [7.2]
+    // STONE [7.2]
     IPLMaterial { absorption: [0.05, 0.05, 0.05], scattering: 0.1, transmission: [0.01, 0.01, 0.01] },
-    // Index 2: WOOD / PLANKS (Moderate Absorption) [7.2]
+    // WOOD [7.2]
     IPLMaterial { absorption: [0.10, 0.20, 0.30], scattering: 0.5, transmission: [0.10, 0.05, 0.02] },
-    // Index 3: WOOL / LEAVES / SOUND DEADENING [7.2]
+    // WOOL [7.2]
     IPLMaterial { absorption: [0.60, 0.80, 0.95], scattering: 0.8, transmission: [0.20, 0.05, 0.01] },
-    // Index 4: GLASS (Reflective + high-frequency passing) [7.2]
+    // GLASS [7.2]
     IPLMaterial { absorption: [0.02, 0.02, 0.05], scattering: 0.05, transmission: [0.60, 0.40, 0.20] },
 ];
 
@@ -250,8 +255,6 @@ fn make_vector(d: usize, u: usize, v: usize, cd: f32, cu: f32, cv: f32, center: 
     IPLVector3 { x: coords[0], y: coords[1], z: coords[2] }
 }
 
-/// Möller-Trumbore Ray-Triangle Intersection Solver.
-/// Blazingly fast, real-time safe ray-segment intersector [2.1].
 fn ray_triangle_intersect(
     orig: [f32; 3],
     dir: [f32; 3],
@@ -271,7 +274,7 @@ fn ray_triangle_intersect(
 
     let a = edge1[0] * h[0] + edge1[1] * h[1] + edge1[2] * h[2];
     if a > -EPSILON && a < EPSILON {
-        return None; // Ray is parallel to triangle
+        return None;
     }
 
     let f = 1.0 / a;
@@ -300,14 +303,11 @@ fn ray_triangle_intersect(
     }
 }
 
-/// Dynamic Occlusion & Transmission Raycaster.
-/// Executes Möller-Trumbore sweeps against our thread-safe local safe mesh mirror [5.1].
 pub fn calculate_occlusion_and_transmission(
     _scene: IPLScene,
     source_pos: [f32; 3],
     listener_pos: [f32; 3],
 ) -> (f32, [f32; 3]) {
-    // Thread safety barrier: Skip raycasting during scene commits to prevent stutter [6.2]
     if IS_SCENE_COMMITTING.load(Ordering::Acquire) {
         return (1.0, [1.0, 1.0, 1.0]);
     }
@@ -369,12 +369,10 @@ pub fn calculate_occlusion_and_transmission(
         }
     }
 
-    // Unoccluded path
     if hit_material_idx < 0 {
         return (1.0, [1.0, 1.0, 1.0]);
     }
 
-    // Occluded! Read material's specific transmission profile [7.2]
     let mat_idx = hit_material_idx as usize;
     let transmission = if mat_idx < ACOUSTIC_MATERIALS.len() {
         ACOUSTIC_MATERIALS[mat_idx].transmission
@@ -388,45 +386,54 @@ pub fn calculate_occlusion_and_transmission(
 pub fn rebuild_acoustic_mesh(
     scene: IPLScene,
     _context: IPLContext,
-    voxels: &[u8; 32768],
+    voxels: &[u8; 262144], // Scaled to support full 64x64x64 envelope [7.1]
     center: [i32; 3]
 ) {
     let mut vertices: Vec<IPLVector3> = Vec::new();
     let mut triangles: Vec<IPLTriangle> = Vec::new();
     let mut material_indices: Vec<i32> = Vec::new();
 
+    let mut air_blocks = 0f32;
+    let mut stone_blocks = 0f32;
+
     for d in 0..3 {
         let u = (d + 1) % 3;
         let v = (d + 2) % 3;
 
-        for slice in 0..32 {
+        for slice in 0..64 {
             for side in 0..2 {
-                let mut mask = [[0u8; 32]; 32];
+                let mut mask = [[0u8; 64]; 64];
 
-                for u_coord in 0..32 {
-                    for v_coord in 0..32 {
+                for u_coord in 0..64 {
+                    for v_coord in 0..64 {
                         let mut coords = [0; 3];
                         coords[d] = slice;
                         coords[u] = u_coord;
                         coords[v] = v_coord;
 
-                        let idx = (coords[0] * 1024) + (coords[1] * 32) + coords[2];
+                        let idx = (coords[0] * 4096) + (coords[1] * 64) + coords[2];
                         let current_val = voxels[idx];
+
+                        if current_val == 0 {
+                            if d == 0 { air_blocks += 1.0 / 3.0; } // avoid triple counting across 3 dimension sweeps
+                        } else if current_val == 1 {
+                            if d == 0 { stone_blocks += 1.0 / 3.0; }
+                        }
 
                         if current_val > 0 {
                             let mut neighbor_coords = coords;
                             let has_neighbor = if side == 0 {
                                 if slice > 0 {
                                     neighbor_coords[d] = slice - 1;
-                                    let n_idx = (neighbor_coords[0] * 1024) + (neighbor_coords[1] * 32) + neighbor_coords[2];
+                                    let n_idx = (neighbor_coords[0] * 4096) + (neighbor_coords[1] * 64) + neighbor_coords[2];
                                     voxels[n_idx] > 0
                                 } else {
                                     false
                                 }
                             } else {
-                                if slice < 31 {
+                                if slice < 63 {
                                     neighbor_coords[d] = slice + 1;
-                                    let n_idx = (neighbor_coords[0] * 1024) + (neighbor_coords[1] * 32) + neighbor_coords[2];
+                                    let n_idx = (neighbor_coords[0] * 4096) + (neighbor_coords[1] * 64) + neighbor_coords[2];
                                     voxels[n_idx] > 0
                                 } else {
                                     false
@@ -440,18 +447,18 @@ pub fn rebuild_acoustic_mesh(
                     }
                 }
 
-                let mut visited = [[false; 32]; 32];
-                for u_s in 0..32 {
-                    for v_s in 0..32 {
+                let mut visited = [[false; 64]; 64];
+                for u_s in 0..64 {
+                    for v_s in 0..64 {
                         let m = mask[u_s][v_s];
                         if m > 0 && !visited[u_s][v_s] {
                             let mut w = 1;
-                            while u_s + w < 32 && mask[u_s + w][v_s] == m && !visited[u_s + w][v_s] {
+                            while u_s + w < 64 && mask[u_s + w][v_s] == m && !visited[u_s + w][v_s] {
                                 w += 1;
                             }
 
                             let mut h = 1;
-                            'outer: while v_s + h < 32 {
+                            'outer: while v_s + h < 64 {
                                 for k in 0..w {
                                     if mask[u_s + k][v_s + h] != m || visited[u_s + k][v_s + h] {
                                         break 'outer;
@@ -496,7 +503,6 @@ pub fn rebuild_acoustic_mesh(
         return;
     }
 
-    // Safely update the Phonon Scene context
     unsafe {
         IS_SCENE_COMMITTING.store(true, Ordering::Release);
 
@@ -528,7 +534,6 @@ pub fn rebuild_acoustic_mesh(
 
             *active_mesh_lock = Some(SendStaticMesh(static_mesh));
 
-            // Safely mirror geometry changes over to our pure-math raycast solver
             let mut safe_mesh_lock = ACTIVE_SAFE_MESH.lock().unwrap();
             *safe_mesh_lock = Some(SafeMesh {
                 vertices,
@@ -536,10 +541,76 @@ pub fn rebuild_acoustic_mesh(
                 materials: material_indices,
             });
 
+            let mesh_ref = (*safe_mesh_lock).as_ref().unwrap();
+
+            // Calculate exact physical cave reverberation parameters using Sabine's architectural formula
+            let mut total_area = 0.0f32;
+            let mut weighted_absorption = 0.0f32;
+
+            for (i, tri) in mesh_ref.triangles.iter().enumerate() {
+                let p0 = mesh_ref.vertices[tri.indices[0] as usize];
+                let p1 = mesh_ref.vertices[tri.indices[1] as usize];
+                let p2 = mesh_ref.vertices[tri.indices[2] as usize];
+
+                let e1 = [p1.x - p0.x, p1.y - p0.y, p1.z - p0.z];
+                let e2 = [p2.x - p0.x, p2.y - p0.y, p2.z - p0.z];
+                let cross = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                let tri_area = 0.5 * (cross[0]*cross[0] + cross[1]*cross[1] + cross[2]*cross[2]).sqrt();
+                total_area += tri_area;
+
+                if i < mesh_ref.materials.len() {
+                    let mat_idx = mesh_ref.materials[i] as usize;
+                    if mat_idx < ACOUSTIC_MATERIALS.len() {
+                        let avg_abs = (ACOUSTIC_MATERIALS[mat_idx].absorption[0]
+                            + ACOUSTIC_MATERIALS[mat_idx].absorption[1]
+                            + ACOUSTIC_MATERIALS[mat_idx].absorption[2]) / 3.0f32;
+                        weighted_absorption += tri_area * avg_abs;
+                    }
+                }
+            }
+
+            let avg_abs = if total_area > 0.1 { weighted_absorption / total_area } else { 0.15f32 };
+            let room_volume = air_blocks; // Each block corresponds to exactly 1.0 m^3
+
+            // Sabine's Formula: T60 = 0.161 * V / (A * a + leakage_factor)
+            let leakage = 10.0f32; // Simulates open portal sound leakage to prevent infinite reverb tails
+            let base_t60 = (0.161f32 * room_volume) / (total_area * avg_abs + leakage);
+
+            // Map the frequency absorption decay bands [Low, Mid, High]
+            let low_decay = base_t60 * 1.5;
+            let mid_decay = base_t60;
+            let high_decay = base_t60 * 0.5; // High frequencies decay twice as fast due to air absorption
+
+            let stone_ratio = stone_blocks / 262144.0;
+            let is_underground = stone_ratio > 0.4; // Threshold determining if listener is enclosed in a cave
+
+            let mut env_lock = ACTIVE_ENVIRONMENT.lock().unwrap();
+            if is_underground && room_volume > 1000.0 {
+                env_lock.t60 = [
+                    low_decay.clamp(0.2, 5.0),
+                    mid_decay.clamp(0.2, 4.0),
+                    high_decay.clamp(0.1, 2.0),
+                ];
+                // Increase wet reverb blend based on underground cavity depth
+                env_lock.wet_mix = (stone_ratio * 2.0).clamp(0.0, 0.4);
+            } else {
+                // Outdoor/Overworld dampening profile (extremely dry, dead echoes)
+                env_lock.t60 = [0.1, 0.1, 0.1];
+                env_lock.wet_mix = 0.0;
+            }
+
             println!(
-                "[Rust Daemon] Acoustic scene commit successful. Compiled {} vertices, {} triangles.",
-                (*safe_mesh_lock).as_ref().unwrap().vertices.len(),
-                (*safe_mesh_lock).as_ref().unwrap().triangles.len()
+                "[Rust Daemon] Meshing committed. Triangles: {}, Est. Volume: {} m3, T60: [{:.2}s, {:.2}s, {:.2}s], Wet Send: {:.1}%",
+                mesh_ref.triangles.len(),
+                room_volume as u32,
+                env_lock.t60[0],
+                env_lock.t60[1],
+                env_lock.t60[2],
+                env_lock.wet_mix * 100.0
             );
         } else {
             eprintln!("[Rust Daemon] Failed to compile static mesh: Status {}", status);

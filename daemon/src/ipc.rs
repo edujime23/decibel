@@ -157,17 +157,16 @@ pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Se
             let cy = LittleEndian::read_i32(&mmap[OFFSET_CENTER_Y .. OFFSET_CENTER_Y + 4]);
             let cz = LittleEndian::read_i32(&mmap[OFFSET_CENTER_Z .. OFFSET_CENTER_Z + 4]);
 
-            // Read raw bytes representing the grid from mapped memory
-            let mut voxel_bytes = [0u8; 32768];
-            voxel_bytes.copy_from_slice(&mmap[OFFSET_VOXEL_GRID .. OFFSET_VOXEL_GRID + 32768]);
+            // Fix E0308: Use a heap-allocated (Boxed) array to safely hold 256KB without risking stack overflow [1.2.1]
+            let mut voxel_bytes = Box::new([0u8; 262144]);
+            voxel_bytes[..].copy_from_slice(&mmap[OFFSET_VOXEL_GRID .. OFFSET_VOXEL_GRID + 262144]);
 
-            // Spawn CPU-heavy geometry processing off the control thread
             let app_state_task = Arc::clone(&app_state);
             tokio::task::spawn_blocking(move || {
                 crate::phonon::rebuild_acoustic_mesh(
                     app_state_task.scene,
                     app_state_task.context,
-                    &voxel_bytes,
+                    &*voxel_bytes, // Dereference coercion from Box<[u8; 262144]> to &[u8; 262144] [1.2.1]
                     [cx, cy, cz]
                 );
             });

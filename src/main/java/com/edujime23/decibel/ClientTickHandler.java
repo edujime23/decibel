@@ -24,8 +24,8 @@ public class ClientTickHandler {
         return thread;
     });
 
-    private static BlockPos lastCentroid = null;
-    private static final byte[] VOXEL_CACHE = new byte[32 * 32 * 32];
+    private static long lastUpdateTime = 0;
+    private static final byte[] VOXEL_CACHE = new byte[64 * 64 * 64];
 
     @SubscribeEvent
     public static void onClientTick(ClientTickEvent.Post event) {
@@ -33,24 +33,12 @@ public class ClientTickHandler {
 
         Minecraft mc = Minecraft.getInstance();
         if (mc.player != null && mc.level != null && DaemonManager.ipc != null) {
-            BlockPos currentPos = mc.player.blockPosition();
+            long currentTime = System.currentTimeMillis();
 
-            // Safe Distance Check: Immune to mappings, Mojang releases, or Yarn versions
-            boolean shouldUpdate = false;
-            if (lastCentroid == null) {
-                shouldUpdate = true;
-            } else {
-                int dx = lastCentroid.getX() - currentPos.getX();
-                int dy = lastCentroid.getY() - currentPos.getY();
-                int dz = lastCentroid.getZ() - currentPos.getZ();
-                int distanceSquared = (dx * dx) + (dy * dy) + (dz * dz);
-                if (distanceSquared >= 1) {
-                    shouldUpdate = true;
-                }
-            }
-
-            if (shouldUpdate) {
-                lastCentroid = currentPos;
+            // Continuous poll throttled at 100ms: Instantly captures block breaks, places, and explosions [7.1]
+            if (currentTime - lastUpdateTime >= 100) {
+                lastUpdateTime = currentTime;
+                BlockPos currentPos = mc.player.blockPosition();
                 Level level = mc.level;
 
                 GEOMETRY_WORKER.submit(() -> rebuildLocalAcoustics(level, currentPos));
@@ -59,22 +47,23 @@ public class ClientTickHandler {
     }
 
     private static void rebuildLocalAcoustics(Level level, BlockPos center) {
-        int startX = center.getX() - 16;
-        int startY = center.getY() - 16;
-        int startZ = center.getZ() - 16;
+        // Expand sweep to 64x64x64 blocks centered on the player [7.1]
+        int startX = center.getX() - 32;
+        int startY = center.getY() - 32;
+        int startZ = center.getZ() - 32;
 
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
 
-        for (int x = 0; x < 32; x++) {
-            for (int y = 0; y < 32; y++) {
-                for (int z = 0; z < 32; z++) {
+        for (int x = 0; x < 64; x++) {
+            for (int y = 0; y < 64; y++) {
+                for (int z = 0; z < 64; z++) {
                     pos.set(startX + x, startY + y, startZ + z);
 
                     if (level.hasChunkAt(pos)) {
                         BlockState state = level.getBlockState(pos);
-                        VOXEL_CACHE[(x * 1024) + (y * 32) + z] = getAcousticMaterialId(state);
+                        VOXEL_CACHE[(x * 4096) + (y * 64) + z] = getAcousticMaterialId(state);
                     } else {
-                        VOXEL_CACHE[(x * 1024) + (y * 32) + z] = 0; // Boundary defaults to AIR
+                        VOXEL_CACHE[(x * 4096) + (y * 64) + z] = 0; // Boundary defaults to AIR
                     }
                 }
             }
@@ -88,12 +77,11 @@ public class ClientTickHandler {
             return 0; // AIR
         }
 
-        // Culling fluid states to keep structural paths clean [7.3]
+        // Culling fluids to preserve clean ray segments [7.3]
         if (!state.getFluidState().isEmpty()) {
             return 0;
         }
 
-        // Resolves standard namespace keys safely across all versions
         String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString().toLowerCase(Locale.ROOT);
         return MaterialRegistry.getMaterialId(blockId);
     }
@@ -101,14 +89,14 @@ public class ClientTickHandler {
     @SubscribeEvent
     public static void onPlayerLoggedOut(ClientPlayerNetworkEvent.LoggingOut event) {
         SoundInterceptor.forceStopAll();
-        lastCentroid = null;
+        lastUpdateTime = 0;
     }
 
     @SubscribeEvent
     public static void onLevelUnload(LevelEvent.Unload event) {
         if (event.getLevel().isClientSide()) {
             SoundInterceptor.forceStopAll();
-            lastCentroid = null;
+            lastUpdateTime = 0;
         }
     }
 }

@@ -8,6 +8,9 @@ use crate::phonon;
 
 const FRAME_SIZE: usize = 512;
 
+// Prime delay line sizes (in samples) to prevent metallic comb filtering resonances
+const DELAY_SIZES: [usize; 4] = [977, 1277, 1637, 1997];
+
 pub enum AudioCommand {
     PlaySound {
         uid: u32,
@@ -77,6 +80,80 @@ struct SharedAudioState {
     accum_l: Vec<f32>,
     accum_r: Vec<f32>,
     resample_cursor: f32,
+}
+
+// Feedback Delay Network Reverb Filter Context
+struct FdnReverb {
+    buffers: [Vec<f32>; 4],
+    indices: [usize; 4],
+    lowpass_states: [f32; 4],
+}
+
+impl FdnReverb {
+    fn new() -> Self {
+        FdnReverb {
+            buffers: [
+                vec![0.0; DELAY_SIZES[0]],
+                vec![0.0; DELAY_SIZES[1]],
+                vec![0.0; DELAY_SIZES[2]],
+                vec![0.0; DELAY_SIZES[3]],
+            ],
+            indices: [0; 4],
+            lowpass_states: [0.0; 4],
+        }
+    }
+
+    /// Process a mono sample through the FDN Reverb block
+    fn process(&mut self, input: f32, t60: [f32; 3], wet_mix: f32) -> f32 {
+        if wet_mix <= 0.005 {
+            return 0.0;
+        }
+
+        // Map T60 decay times directly to delay line feedback coefficients
+        let mid_decay = t60[1].max(0.1);
+        let feedback_gain: [f32; 4] = [
+            ( -60.0 * (DELAY_SIZES[0] as f32 / 48000.0) / mid_decay ).exp2().clamp(0.0, 0.95),
+            ( -60.0 * (DELAY_SIZES[1] as f32 / 48000.0) / mid_decay ).exp2().clamp(0.0, 0.95),
+            ( -60.0 * (DELAY_SIZES[2] as f32 / 48000.0) / mid_decay ).exp2().clamp(0.0, 0.95),
+            ( -60.0 * (DELAY_SIZES[3] as f32 / 48000.0) / mid_decay ).exp2().clamp(0.0, 0.95),
+        ];
+
+        let mut d = [0.0f32; 4];
+        for i in 0..4 {
+            d[i] = self.buffers[i][self.indices[i]];
+        }
+
+        // Hadarmard matrix multiplication (unrolls to cheap additions, zero divisions)
+        let tmp0 = d[0] + d[1];
+        let tmp1 = d[2] + d[3];
+        let tmp2 = d[0] - d[1];
+        let tmp3 = d[2] - d[3];
+
+        let out = [
+            0.5 * (tmp0 + tmp1),
+            0.5 * (tmp0 - tmp1),
+            0.5 * (tmp2 + tmp3),
+            0.5 * (tmp2 - tmp3),
+        ];
+
+        // Apply lowpass filters to delay loops to simulate frequency-dependent high decay [7.2]
+        let high_decay_ratio = (t60[2] / t60[1]).clamp(0.1, 0.9);
+        let lpf_coefficient = 1.0 - high_decay_ratio;
+
+        for i in 0..4 {
+            let output_with_feedback = input + out[i] * feedback_gain[i];
+
+            // 1st order recursive lowpass filter
+            self.lowpass_states[i] = self.lowpass_states[i] * lpf_coefficient
+                + output_with_feedback * (1.0 - lpf_coefficient);
+
+            self.buffers[i][self.indices[i]] = self.lowpass_states[i];
+            self.indices[i] = (self.indices[i] + 1) % DELAY_SIZES[i];
+        }
+
+        // Blend mixed wet delay components
+        (out[0] + out[1] + out[2] + out[3]) * 0.25 * wet_mix
+    }
 }
 
 pub fn run_audio_thread(
@@ -341,6 +418,9 @@ fn build_stream_result(
     let device_sample_rate = config.sample_rate().0 as f32;
     let output_channels = config.channels() as usize;
 
+    let mut reverb_l = FdnReverb::new();
+    let mut reverb_r = FdnReverb::new();
+
     device.build_output_stream(
         &config.clone().into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -350,8 +430,6 @@ fn build_stream_result(
                 return;
             }
 
-            // Real-Time Safety Guarantee: Try locking the state instead of blocking.
-            // If locked, we skip to prevent buffer starvation and preserve stream scheduling.
             let mut state = match state.try_lock() {
                 Ok(s) => s,
                 Err(_) => return,
@@ -365,8 +443,8 @@ fn build_stream_result(
             let enable_steam_audio = (state.engine_flags & (1 << 1)) != 0;
             let enable_occlusion = (state.engine_flags & (1 << 2)) != 0;
             let enable_transmission = (state.engine_flags & (1 << 3)) != 0;
+            let enable_reverb = (state.engine_flags & (1 << 4)) != 0;
 
-            // Strict allocation-free buffers using stack memory
             let mut mix_l = [0.0f32; FRAME_SIZE];
             let mut mix_r = [0.0f32; FRAME_SIZE];
             let mut mono_input = [0.0f32; FRAME_SIZE];
@@ -486,9 +564,6 @@ fn build_stream_result(
                             ( -0.10 * distance ).exp().max(0.01),
                         ];
 
-                        // DYNAMIC REAL-TIME RAYCAST SIMULATION:
-                        // Instead of hardcoding static parameters, we perform immediate line segment intersection
-                        // against your greedy-meshed voxel scene [5.1].
                         let (occlusion_val, transmission_val) = if enable_occlusion || enable_transmission {
                             phonon::calculate_occlusion_and_transmission(
                                 app_state.scene,
@@ -550,6 +625,21 @@ fn build_stream_result(
                     i += 1;
                 }
 
+                // Process cave reverberation using the physics-based environmental parameters
+                if enable_reverb {
+                    let env = phonon::ACTIVE_ENVIRONMENT.lock().unwrap();
+                    let t60 = env.t60;
+                    let wet_mix = env.wet_mix;
+
+                    for f in 0..FRAME_SIZE {
+                        let wet_l = reverb_l.process(mix_l[f], t60, wet_mix);
+                        let wet_r = reverb_r.process(mix_r[f], t60, wet_mix);
+
+                        mix_l[f] += wet_l;
+                        mix_r[f] += wet_r;
+                    }
+                }
+
                 state.accum_l.extend_from_slice(&mix_l);
                 state.accum_r.extend_from_slice(&mix_r);
             }
@@ -558,7 +648,6 @@ fn build_stream_result(
                 let idx = state.resample_cursor as usize;
                 let t = state.resample_cursor - idx as f32;
 
-                // Absolute boundary check to guard against out-of-bounds panics
                 let sample_l = if idx + 1 < state.accum_l.len() {
                     state.accum_l[idx] * (1.0 - t) + state.accum_l[idx + 1] * t
                 } else if idx < state.accum_l.len() {

@@ -13,27 +13,24 @@ public class SharedMemoryRingBuffer {
     public static final int QUEUE_CAPACITY = 1024;
     public static final int SLOT_SIZE = 64;
 
-    // Aligned Offsets matching Rust Layout (Offsets in Bytes)
     private static final int OFFSET_JAVA_WRITE_SEQ = 0;
     private static final int OFFSET_RUST_READ_SEQ = 64;
     private static final int OFFSET_VER = 128;
     private static final int OFFSET_DEV_SEQ = 192;
     private static final int OFFSET_DEV_NAME = 196;
 
-    // Voxel Geometry Parameters (Cache Line 5)
     private static final int OFFSET_VOXEL_GRID_VERSION = 320;
     private static final int OFFSET_CENTER_X = 324;
     private static final int OFFSET_CENTER_Y = 328;
     private static final int OFFSET_CENTER_Z = 332;
 
     private static final int HEADER_SIZE = 512;
-    private static final int RING_BUFFER_SIZE = QUEUE_CAPACITY * SLOT_SIZE; // 65,536 bytes
+    private static final int RING_BUFFER_SIZE = QUEUE_CAPACITY * SLOT_SIZE;
 
-    // Voxel Grid starts immediately after the ring buffer (Offset: 66,048)
-    private static final int OFFSET_VOXEL_GRID = HEADER_SIZE + RING_BUFFER_SIZE;
-    private static final int VOXEL_GRID_SIZE = 32 * 32 * 32; // 32,768 bytes
+    private static final int OFFSET_VOXEL_GRID = HEADER_SIZE + RING_BUFFER_SIZE; // 66,048
+    private static final int VOXEL_GRID_SIZE = 64 * 64 * 64; // 262,144 bytes
 
-    public static final int SHM_SIZE = OFFSET_VOXEL_GRID + VOXEL_GRID_SIZE; // 98,816 bytes
+    public static final int SHM_SIZE = OFFSET_VOXEL_GRID + VOXEL_GRID_SIZE; // 328,192 bytes
 
     private final MappedByteBuffer buffer;
     private final AtomicInteger writeSequence = new AtomicInteger(0);
@@ -66,21 +63,18 @@ public class SharedMemoryRingBuffer {
 
     public synchronized void updateVoxelGrid(byte[] voxelData, int centerX, int centerY, int centerZ) {
         if (voxelData.length != VOXEL_GRID_SIZE) {
-            throw new IllegalArgumentException("Voxel grid data must be exactly 32768 bytes.");
+            throw new IllegalArgumentException("Voxel grid data must be exactly 262144 bytes.");
         }
 
-        // Copy raw voxel data directly into the mapped memory-mapped block
         int startPos = buffer.position();
         buffer.position(OFFSET_VOXEL_GRID);
         buffer.put(voxelData);
         buffer.position(startPos);
 
-        // Write the coordinate translation offsets
         INT_VIEW.setRelease(buffer, OFFSET_CENTER_X, centerX);
         INT_VIEW.setRelease(buffer, OFFSET_CENTER_Y, centerY);
         INT_VIEW.setRelease(buffer, OFFSET_CENTER_Z, centerZ);
 
-        // Increment version to signal the native daemon thread
         voxelVersion++;
         INT_VIEW.setRelease(buffer, OFFSET_VOXEL_GRID_VERSION, voxelVersion);
     }
