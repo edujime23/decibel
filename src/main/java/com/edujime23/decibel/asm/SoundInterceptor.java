@@ -14,10 +14,16 @@ import org.joml.Vector3f;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Collections;
+import java.util.Map;
+import java.util.WeakHashMap;
+
 public class SoundInterceptor {
     private static final Logger LOGGER = LoggerFactory.getLogger("Decibel-Interceptor");
     private static final java.util.concurrent.atomic.AtomicInteger soundIdGenerator = new java.util.concurrent.atomic.AtomicInteger(1);
-    private static final java.util.concurrent.ConcurrentHashMap<SoundInstance, Integer> activeSoundUids = new java.util.concurrent.ConcurrentHashMap<>();
+
+    // Solves Memory Leak: Using WeakHashMap prevents holding strong references to transient sounds
+    private static final Map<SoundInstance, Integer> activeSoundUids = Collections.synchronizedMap(new WeakHashMap<>());
 
     public static boolean onPlaySound(SoundInstance sound) {
         if (sound == null) {
@@ -44,7 +50,6 @@ public class SoundInterceptor {
             boolean relative = sound.isRelative();
             boolean spatial = sound.getAttenuation() != SoundInstance.Attenuation.NONE;
 
-            // Force Jukebox records to remain strictly spatialized to their physical coordinates
             if (sound.getSource() == SoundSource.RECORDS) {
                 relative = false;
                 spatial = true;
@@ -92,19 +97,37 @@ public class SoundInterceptor {
         return false;
     }
 
+    /**
+     * Standard SoundEngine cleanup hook.
+     * Retains the level == null safety guard to prevent options/video settings reloads
+     * from silencing playing Jukebox tracks mid-game.
+     */
     public static void onStopAll() {
         if (DaemonManager.ipc == null) {
             return;
         }
         try {
-            // Only stop all playing sounds if we are actually exiting the world (level is null).
-            // This prevents Minecraft's native options reload from silencing Jukebox records mid-game.
             if (Minecraft.getInstance().level == null) {
-                activeSoundUids.clear();
-                DaemonManager.ipc.writeStopAllEvent();
+                forceStopAll();
             }
         } catch (Throwable t) {
             LOGGER.error("Failed to process stop-all sounds in interceptor", t);
+        }
+    }
+
+    /**
+     * Forces immediate stops of all active tracking registries and pushes the stop opcode to the daemon.
+     * Used on true world disconnects and portal/dimension travel.
+     */
+    public static void forceStopAll() {
+        if (DaemonManager.ipc == null) {
+            return;
+        }
+        try {
+            activeSoundUids.clear();
+            DaemonManager.ipc.writeStopAllEvent();
+        } catch (Throwable t) {
+            LOGGER.error("Failed to force stop all active sounds on the daemon", t);
         }
     }
 

@@ -2,6 +2,8 @@ package com.edujime23.decibel.ipc;
 
 import java.io.File;
 import java.io.RandomAccessFile;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
@@ -10,13 +12,37 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class SharedMemoryRingBuffer {
     public static final int QUEUE_CAPACITY = 1024;
     public static final int SLOT_SIZE = 64;
-    private static final int HEADER_SIZE = 256;
-    public static final int SHM_SIZE = HEADER_SIZE + (QUEUE_CAPACITY * SLOT_SIZE);
+
+    // Aligned Offsets matching Rust Layout (Offsets in Bytes)
+    private static final int OFFSET_JAVA_WRITE_SEQ = 0;
+    private static final int OFFSET_RUST_READ_SEQ = 64;
+    private static final int OFFSET_VER = 128;
+    private static final int OFFSET_DEV_SEQ = 192;
+    private static final int OFFSET_DEV_NAME = 196;
+
+    // Voxel Geometry Parameters (Cache Line 5)
+    private static final int OFFSET_VOXEL_GRID_VERSION = 320;
+    private static final int OFFSET_CENTER_X = 324;
+    private static final int OFFSET_CENTER_Y = 328;
+    private static final int OFFSET_CENTER_Z = 332;
+
+    private static final int HEADER_SIZE = 512;
+    private static final int RING_BUFFER_SIZE = QUEUE_CAPACITY * SLOT_SIZE; // 65,536 bytes
+
+    // Voxel Grid starts immediately after the ring buffer (Offset: 66,048)
+    private static final int OFFSET_VOXEL_GRID = HEADER_SIZE + RING_BUFFER_SIZE;
+    private static final int VOXEL_GRID_SIZE = 32 * 32 * 32; // 32,768 bytes
+
+    public static final int SHM_SIZE = OFFSET_VOXEL_GRID + VOXEL_GRID_SIZE; // 98,816 bytes
 
     private final MappedByteBuffer buffer;
     private final AtomicInteger writeSequence = new AtomicInteger(0);
     private int lastDeviceSeq = 0;
     private String lastSentDevice = "";
+    private int voxelVersion = 0;
+
+    private static final VarHandle INT_VIEW = MethodHandles.byteBufferViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
+    private static final VarHandle FLOAT_VIEW = MethodHandles.byteBufferViewVarHandle(float[].class, ByteOrder.LITTLE_ENDIAN);
 
     public SharedMemoryRingBuffer(File shmFile) throws Exception {
         try (RandomAccessFile memoryFile = new RandomAccessFile(shmFile, "rw")) {
@@ -24,46 +50,70 @@ public class SharedMemoryRingBuffer {
             this.buffer = memoryFile.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, SHM_SIZE);
             this.buffer.order(ByteOrder.LITTLE_ENDIAN);
 
-            this.buffer.putInt(0, 0);
-            this.buffer.putInt(4, 0);
-            this.buffer.putInt(8, 0);
+            INT_VIEW.setRelease(buffer, OFFSET_JAVA_WRITE_SEQ, 0);
+            INT_VIEW.setRelease(buffer, OFFSET_RUST_READ_SEQ, 0);
+            INT_VIEW.setRelease(buffer, OFFSET_VER, 0);
+            INT_VIEW.setRelease(buffer, OFFSET_DEV_SEQ, 0);
+            INT_VIEW.setRelease(buffer, OFFSET_VOXEL_GRID_VERSION, 0);
 
             for (int i = 12; i < HEADER_SIZE; i += 4) {
-                this.buffer.putFloat(i, 0.0f);
+                if (i != OFFSET_RUST_READ_SEQ && i != OFFSET_VER && i != OFFSET_DEV_SEQ && i != OFFSET_VOXEL_GRID_VERSION) {
+                    buffer.putFloat(i, 0.0f);
+                }
             }
         }
     }
 
+    public synchronized void updateVoxelGrid(byte[] voxelData, int centerX, int centerY, int centerZ) {
+        if (voxelData.length != VOXEL_GRID_SIZE) {
+            throw new IllegalArgumentException("Voxel grid data must be exactly 32768 bytes.");
+        }
+
+        // Copy raw voxel data directly into the mapped memory-mapped block
+        int startPos = buffer.position();
+        buffer.position(OFFSET_VOXEL_GRID);
+        buffer.put(voxelData);
+        buffer.position(startPos);
+
+        // Write the coordinate translation offsets
+        INT_VIEW.setRelease(buffer, OFFSET_CENTER_X, centerX);
+        INT_VIEW.setRelease(buffer, OFFSET_CENTER_Y, centerY);
+        INT_VIEW.setRelease(buffer, OFFSET_CENTER_Z, centerZ);
+
+        // Increment version to signal the native daemon thread
+        voxelVersion++;
+        INT_VIEW.setRelease(buffer, OFFSET_VOXEL_GRID_VERSION, voxelVersion);
+    }
+
     public synchronized void updateListener(float x, float y, float z, float fX, float fY, float fZ, float uX, float uY, float uZ) {
-        int ver = buffer.getInt(8);
-        buffer.putInt(8, ver + 1);
+        int ver = (int) INT_VIEW.getAcquire(buffer, OFFSET_VER);
+        INT_VIEW.setRelease(buffer, OFFSET_VER, ver + 1);
 
-        buffer.putFloat(12, x);
-        buffer.putFloat(16, y);
-        buffer.putFloat(20, z);
-        buffer.putFloat(24, fX);
-        buffer.putFloat(28, fY);
-        buffer.putFloat(32, fZ);
-        buffer.putFloat(36, uX);
-        buffer.putFloat(40, uY);
-        buffer.putFloat(44, uZ);
+        FLOAT_VIEW.setRelease(buffer, 12, x);
+        FLOAT_VIEW.setRelease(buffer, 16, y);
+        FLOAT_VIEW.setRelease(buffer, 20, z);
+        FLOAT_VIEW.setRelease(buffer, 24, fX);
+        FLOAT_VIEW.setRelease(buffer, 28, fY);
+        FLOAT_VIEW.setRelease(buffer, 32, fZ);
+        FLOAT_VIEW.setRelease(buffer, 36, uX);
+        FLOAT_VIEW.setRelease(buffer, 40, uY);
+        FLOAT_VIEW.setRelease(buffer, 44, uZ);
 
-        buffer.putInt(8, ver + 2);
+        INT_VIEW.setRelease(buffer, OFFSET_VER, ver + 2);
     }
 
     public synchronized void updateGlobalState(float[] categoryVols, int flags) {
-        int ver = buffer.getInt(8);
-        buffer.putInt(8, ver + 1);
+        int ver = (int) INT_VIEW.getAcquire(buffer, OFFSET_VER);
+        INT_VIEW.setRelease(buffer, OFFSET_VER, ver + 1);
 
         int volOffset = 48;
         for (int i = 0; i < 16; i++) {
             float vol = (i < categoryVols.length) ? categoryVols[i] : 1.0f;
-            buffer.putFloat(volOffset + (i * 4), vol);
+            FLOAT_VIEW.setRelease(buffer, volOffset + (i * 4), vol);
         }
 
-        buffer.putInt(112, flags);
-
-        buffer.putInt(8, ver + 2);
+        INT_VIEW.setRelease(buffer, 112, flags);
+        INT_VIEW.setRelease(buffer, OFFSET_VER, ver + 2);
     }
 
     public synchronized void updateOutputDevice(String deviceName) {
@@ -72,14 +122,14 @@ public class SharedMemoryRingBuffer {
         byte[] bytes = deviceName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
         int writeLen = Math.min(bytes.length, 127);
 
-        int nameOffset = 120;
+        int nameOffset = OFFSET_DEV_NAME;
         for (int i = 0; i < writeLen; i++) {
             buffer.put(nameOffset + i, bytes[i]);
         }
         buffer.put(nameOffset + writeLen, (byte) 0);
 
         lastDeviceSeq++;
-        buffer.putInt(116, lastDeviceSeq);
+        INT_VIEW.setRelease(buffer, OFFSET_DEV_SEQ, lastDeviceSeq);
         lastSentDevice = deviceName;
     }
 
@@ -88,25 +138,25 @@ public class SharedMemoryRingBuffer {
         int slotIndex = seq % QUEUE_CAPACITY;
         int offset = HEADER_SIZE + (slotIndex * SLOT_SIZE);
 
-        int rustReadSeq = buffer.getInt(4);
+        int rustReadSeq = (int) INT_VIEW.getAcquire(buffer, OFFSET_RUST_READ_SEQ);
         if (seq - rustReadSeq >= QUEUE_CAPACITY) {
             return false;
         }
 
-        buffer.putInt(offset, OpCodes.OP_PLAY);
-        buffer.putInt(offset + 4, uid);
-        buffer.putFloat(offset + 8, x);
-        buffer.putFloat(offset + 12, y);
-        buffer.putFloat(offset + 16, z);
-        buffer.putFloat(offset + 20, volume);
-        buffer.putFloat(offset + 24, pitch);
-        buffer.putInt(offset + 28, assetHash);
+        INT_VIEW.setRelease(buffer, offset, OpCodes.OP_PLAY);
+        INT_VIEW.setRelease(buffer, offset + 4, uid);
+        FLOAT_VIEW.setRelease(buffer, offset + 8, x);
+        FLOAT_VIEW.setRelease(buffer, offset + 12, y);
+        FLOAT_VIEW.setRelease(buffer, offset + 16, z);
+        FLOAT_VIEW.setRelease(buffer, offset + 20, volume);
+        FLOAT_VIEW.setRelease(buffer, offset + 24, pitch);
+        INT_VIEW.setRelease(buffer, offset + 28, assetHash);
 
         buffer.put(offset + 32, (byte) (relative ? 1 : 0));
         buffer.put(offset + 33, (byte) (spatial ? 1 : 0));
         buffer.put(offset + 34, (byte) categoryId);
 
-        buffer.putInt(0, seq + 1);
+        INT_VIEW.setRelease(buffer, OFFSET_JAVA_WRITE_SEQ, seq + 1);
         writeSequence.incrementAndGet();
 
         return true;
@@ -117,18 +167,18 @@ public class SharedMemoryRingBuffer {
         int slotIndex = seq % QUEUE_CAPACITY;
         int offset = HEADER_SIZE + (slotIndex * SLOT_SIZE);
 
-        int rustReadSeq = buffer.getInt(4);
+        int rustReadSeq = (int) INT_VIEW.getAcquire(buffer, OFFSET_RUST_READ_SEQ);
         if (seq - rustReadSeq >= QUEUE_CAPACITY) {
             return false;
         }
 
-        buffer.putInt(offset, OpCodes.OP_STOP);
-        buffer.putInt(offset + 4, uid);
+        INT_VIEW.setRelease(buffer, offset, OpCodes.OP_STOP);
+        INT_VIEW.setRelease(buffer, offset + 4, uid);
         for (int i = 8; i < SLOT_SIZE; i += 4) {
-            buffer.putInt(offset + i, 0);
+            INT_VIEW.setRelease(buffer, offset + i, 0);
         }
 
-        buffer.putInt(0, seq + 1);
+        INT_VIEW.setRelease(buffer, OFFSET_JAVA_WRITE_SEQ, seq + 1);
         writeSequence.incrementAndGet();
 
         return true;
@@ -139,17 +189,17 @@ public class SharedMemoryRingBuffer {
         int slotIndex = seq % QUEUE_CAPACITY;
         int offset = HEADER_SIZE + (slotIndex * SLOT_SIZE);
 
-        int rustReadSeq = buffer.getInt(4);
+        int rustReadSeq = (int) INT_VIEW.getAcquire(buffer, OFFSET_RUST_READ_SEQ);
         if (seq - rustReadSeq >= QUEUE_CAPACITY) {
             return false;
         }
 
-        buffer.putInt(offset, OpCodes.OP_STOP_ALL);
+        INT_VIEW.setRelease(buffer, offset, OpCodes.OP_STOP_ALL);
         for (int i = 4; i < SLOT_SIZE; i += 4) {
-            buffer.putInt(offset + i, 0);
+            INT_VIEW.setRelease(buffer, offset + i, 0);
         }
 
-        buffer.putInt(0, seq + 1);
+        INT_VIEW.setRelease(buffer, OFFSET_JAVA_WRITE_SEQ, seq + 1);
         writeSequence.incrementAndGet();
 
         return true;

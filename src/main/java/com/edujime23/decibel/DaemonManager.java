@@ -22,6 +22,9 @@ public class DaemonManager {
     public static void init() {
         try {
             LOGGER.info("Initializing Decibel Out-of-Process Audio Engine...");
+
+            MaterialRegistry.init();
+
             String osName = System.getProperty("os.name").toLowerCase(Locale.ROOT);
             boolean isWindows = osName.contains("win");
             boolean isMac = osName.contains("mac");

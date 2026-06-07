@@ -4,7 +4,9 @@ use cpal::traits::{DeviceTrait, StreamTrait, HostTrait};
 
 use crate::AppState;
 use crate::asset::PCMAsset;
-use crate::steam;
+use crate::phonon;
+
+const FRAME_SIZE: usize = 512;
 
 pub enum AudioCommand {
     PlaySound {
@@ -48,8 +50,8 @@ struct ActiveSound {
     is_relative: bool,
     is_spatial: bool,
     category_id: usize,
-    direct_effect: steam::SteamDirectEffect,
-    binaural_effect: steam::SteamBinauralEffect,
+    direct_effect: phonon::SteamDirectEffect,
+    binaural_effect: phonon::SteamBinauralEffect,
 }
 
 struct DeferredPlay {
@@ -106,7 +108,6 @@ pub fn run_audio_thread(
     let _ = stream.play();
 
     loop {
-        // Query interval set to 100ms to achieve instant cross-platform hardware hot-swaps
         let result = rx_cmd.recv_timeout(std::time::Duration::from_millis(100));
         match result {
             Ok(cmd) => {
@@ -121,8 +122,8 @@ pub fn run_audio_thread(
                                     let deferred = state.deferred_plays.remove(i);
                                     let base_step = asset.sample_rate as f32 / 48000.0f32;
 
-                                    let direct = steam::SteamDirectEffect::new(app_state.context, 48000, 512);
-                                    let binaural = steam::SteamBinauralEffect::new(
+                                    let direct = phonon::SteamDirectEffect::new(app_state.context, 48000, 512);
+                                    let binaural = phonon::SteamBinauralEffect::new(
                                         app_state.context,
                                         48000,
                                         512,
@@ -180,8 +181,8 @@ pub fn run_audio_thread(
 
                         if let Some((pcm, sample_rate, channels)) = pcm_to_add {
                             let base_step = sample_rate as f32 / 48000.0f32;
-                            let direct = steam::SteamDirectEffect::new(app_state.context, 48000, 512);
-                            let binaural = steam::SteamBinauralEffect::new(
+                            let direct = phonon::SteamDirectEffect::new(app_state.context, 48000, 512);
+                            let binaural = phonon::SteamBinauralEffect::new(
                                 app_state.context,
                                 48000,
                                 512,
@@ -216,7 +217,6 @@ pub fn run_audio_thread(
                                     is_spatial,
                                     category_id,
                                 });
-                                println!("[Rust Daemon] Deferred play command cached for asset: {}", asset_hash);
                             }
                         }
                     }
@@ -241,7 +241,7 @@ pub fn run_audio_thread(
                         if let Some(new_dev) = found_device {
                             if let Ok(new_cfg) = new_dev.default_output_config() {
                                 let _ = stream.pause();
-                                drop(stream); // Safely unbind from the OS audio driver first
+                                drop(stream);
 
                                 let state_cb = Arc::clone(&shared_state);
                                 let app_state_cb = Arc::clone(&app_state);
@@ -250,7 +250,6 @@ pub fn run_audio_thread(
                                         stream = new_stream;
                                         let _ = stream.play();
 
-                                        // Reset resampler cache states on hardware migration
                                         if let Ok(mut state) = shared_state.lock() {
                                             state.accum_l.clear();
                                             state.accum_r.clear();
@@ -273,7 +272,6 @@ pub fn run_audio_thread(
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                // Dynamic hot-swap fallback check when set to "System Default"
                 if selected_device_name.is_empty() || selected_device_name == "System Default" {
                     let host = cpal::default_host();
                     if let Some(default_dev) = host.default_output_device() {
@@ -290,7 +288,7 @@ pub fn run_audio_thread(
                             if should_migrate {
                                 if let Ok(new_cfg) = default_dev.default_output_config() {
                                     let _ = stream.pause();
-                                    drop(stream); // Instantly drop dead handle to unlock the hardware device
+                                    drop(stream);
 
                                     let state_cb = Arc::clone(&shared_state);
                                     let app_state_cb = Arc::clone(&app_state);
@@ -352,7 +350,9 @@ fn build_stream_result(
                 return;
             }
 
-            let mut state = match state.lock() {
+            // Real-Time Safety Guarantee: Try locking the state instead of blocking.
+            // If locked, we skip to prevent buffer starvation and preserve stream scheduling.
+            let mut state = match state.try_lock() {
                 Ok(s) => s,
                 Err(_) => return,
             };
@@ -360,16 +360,23 @@ fn build_stream_result(
             let output_frames = data.len() / 2;
             let ratio = 48000.0f32 / device_sample_rate;
             let needed_samples = (output_frames as f32 * ratio) as usize + 2;
-            let frame_size = 512;
 
             let is_paused = (state.engine_flags & (1 << 0)) != 0;
             let enable_steam_audio = (state.engine_flags & (1 << 1)) != 0;
             let enable_occlusion = (state.engine_flags & (1 << 2)) != 0;
             let enable_transmission = (state.engine_flags & (1 << 3)) != 0;
 
+            // Strict allocation-free buffers using stack memory
+            let mut mix_l = [0.0f32; FRAME_SIZE];
+            let mut mix_r = [0.0f32; FRAME_SIZE];
+            let mut mono_input = [0.0f32; FRAME_SIZE];
+            let mut direct_output = [0.0f32; FRAME_SIZE];
+            let mut spatialized_l = [0.0f32; FRAME_SIZE];
+            let mut spatialized_r = [0.0f32; FRAME_SIZE];
+
             while state.accum_l.len() < needed_samples {
-                let mut mix_l = vec![0.0f32; frame_size];
-                let mut mix_r = vec![0.0f32; frame_size];
+                mix_l.fill(0.0);
+                mix_r.fill(0.0);
 
                 let listener_pos = state.listener_pos;
                 let listener_fwd = state.listener_fwd;
@@ -388,7 +395,6 @@ fn build_stream_result(
                     }
 
                     if sound.is_relative || !sound.is_spatial || !enable_steam_audio {
-                        // --- 2D DIRECT MIX (Stereo / Mono / Fallback Spatial) ---
                         let (pan, dist_attenuation) = if !sound.is_relative && sound.is_spatial {
                             let dist_vec = [
                                 sound.pos[0] - listener_pos[0],
@@ -416,7 +422,7 @@ fn build_stream_result(
                             (0.5f32, 1.0f32)
                         };
 
-                        for f in 0..frame_size {
+                        for f in 0..FRAME_SIZE {
                             let cursor_idx = (sound.cursor + f as f32 * sound.pitch_step) as usize;
 
                             if cursor_idx * (sound.channels as usize) >= sound.pcm.len() {
@@ -440,9 +446,8 @@ fn build_stream_result(
                             mix_r[f] += r_sample * live_vol * pan.sqrt();
                         }
                     } else {
-                        // --- 3D STEAM AUDIO MIX (Mono Spatialized) ---
-                        let mut mono_input = vec![0.0f32; frame_size];
-                        for f in 0..frame_size {
+                        mono_input.fill(0.0);
+                        for f in 0..FRAME_SIZE {
                             let cursor_idx = (sound.cursor + f as f32 * sound.pitch_step) as usize;
 
                             if cursor_idx * (sound.channels as usize) >= sound.pcm.len() {
@@ -481,29 +486,42 @@ fn build_stream_result(
                             ( -0.10 * distance ).exp().max(0.01),
                         ];
 
-                        let occlusion_val = if enable_occlusion { 0.5f32 } else { 0.0f32 };
-                        let transmission_val = if enable_transmission { [0.7f32, 0.5f32, 0.3f32] } else { [1.0f32, 1.0f32, 1.0f32] };
+                        // DYNAMIC REAL-TIME RAYCAST SIMULATION:
+                        // Instead of hardcoding static parameters, we perform immediate line segment intersection
+                        // against your greedy-meshed voxel scene [5.1].
+                        let (occlusion_val, transmission_val) = if enable_occlusion || enable_transmission {
+                            phonon::calculate_occlusion_and_transmission(
+                                app_state.scene,
+                                sound.pos,
+                                listener_pos,
+                            )
+                        } else {
+                            (1.0f32, [1.0f32, 1.0f32, 1.0f32])
+                        };
 
-                        let mut direct_output = vec![0.0f32; frame_size];
+                        let live_occlusion = if enable_occlusion { occlusion_val } else { 1.0f32 };
+                        let live_transmission = if enable_transmission { transmission_val } else { [1.0f32; 3] };
+
+                        direct_output.fill(0.0);
                         sound.direct_effect.apply(
                             &mono_input,
                             distance_attenuation,
                             air_absorption,
                             engine_flags,
-                            occlusion_val,
-                            transmission_val,
+                            live_occlusion,
+                            live_transmission,
                             &mut direct_output
                         );
 
-                        let direction = steam::get_relative_direction(
+                        let direction = phonon::get_relative_direction(
                             sound.pos,
                             listener_pos,
                             listener_fwd,
                             listener_up
                         );
 
-                        let mut spatialized_l = vec![0.0f32; frame_size];
-                        let mut spatialized_r = vec![0.0f32; frame_size];
+                        spatialized_l.fill(0.0);
+                        spatialized_r.fill(0.0);
 
                         sound.binaural_effect.apply(
                             &direct_output,
@@ -517,7 +535,7 @@ fn build_stream_result(
                             * category_volumes[sound.category_id]
                             * category_volumes[0];
 
-                        for f in 0..frame_size {
+                        for f in 0..FRAME_SIZE {
                             mix_l[f] += spatialized_l[f] * live_vol;
                             mix_r[f] += spatialized_r[f] * live_vol;
                         }
@@ -528,7 +546,7 @@ fn build_stream_result(
                         continue;
                     }
 
-                    sound.cursor += frame_size as f32 * sound.pitch_step;
+                    sound.cursor += FRAME_SIZE as f32 * sound.pitch_step;
                     i += 1;
                 }
 
@@ -540,8 +558,22 @@ fn build_stream_result(
                 let idx = state.resample_cursor as usize;
                 let t = state.resample_cursor - idx as f32;
 
-                let sample_l = state.accum_l[idx] * (1.0 - t) + state.accum_l[idx + 1] * t;
-                let sample_r = state.accum_r[idx] * (1.0 - t) + state.accum_r[idx + 1] * t;
+                // Absolute boundary check to guard against out-of-bounds panics
+                let sample_l = if idx + 1 < state.accum_l.len() {
+                    state.accum_l[idx] * (1.0 - t) + state.accum_l[idx + 1] * t
+                } else if idx < state.accum_l.len() {
+                    state.accum_l[idx]
+                } else {
+                    0.0
+                };
+
+                let sample_r = if idx + 1 < state.accum_r.len() {
+                    state.accum_r[idx] * (1.0 - t) + state.accum_r[idx + 1] * t
+                } else if idx < state.accum_r.len() {
+                    state.accum_r[idx]
+                } else {
+                    0.0
+                };
 
                 data[f * 2] = sample_l;
                 data[f * 2 + 1] = sample_r;
@@ -550,9 +582,10 @@ fn build_stream_result(
             }
 
             let consumed = state.resample_cursor as usize;
-            state.accum_l.drain(0..consumed);
-            state.accum_r.drain(0..consumed);
-            state.resample_cursor -= consumed as f32;
+            let final_consumed = consumed.min(state.accum_l.len()).min(state.accum_r.len());
+            state.accum_l.drain(0..final_consumed);
+            state.accum_r.drain(0..final_consumed);
+            state.resample_cursor -= final_consumed as f32;
         },
         |err| eprintln!("[Rust Daemon] CPAL Error: {}", err),
         None

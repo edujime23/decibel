@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::path::Path;
 use std::fs::OpenOptions;
+use std::sync::atomic::{compiler_fence, Ordering};
 use byteorder::{LittleEndian, ByteOrder};
 use memmap2::MmapMut;
 use tokio::io::AsyncReadExt;
@@ -12,9 +13,23 @@ use crate::asset;
 
 const QUEUE_CAPACITY: usize = 1024;
 const SLOT_SIZE: usize = 64;
-const HEADER_SIZE: usize = 256;
 
-pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: Sender<AudioCommand>) {
+// Cache-Line Aligned Header Structure (Offsets in Bytes)
+const OFFSET_JAVA_WRITE_SEQ: usize      = 0;
+const OFFSET_RUST_READ_SEQ: usize       = 64;
+const OFFSET_VER: usize                 = 128;
+const OFFSET_DEV_SEQ: usize             = 192;
+const OFFSET_DEV_NAME: usize            = 196;
+const OFFSET_VOXEL_GRID_VERSION: usize  = 320;
+const OFFSET_CENTER_X: usize            = 324;
+const OFFSET_CENTER_Y: usize            = 328;
+const OFFSET_CENTER_Z: usize            = 332;
+
+const HEADER_SIZE: usize                = 512;
+const RING_BUFFER_SIZE: usize           = QUEUE_CAPACITY * SLOT_SIZE;
+const OFFSET_VOXEL_GRID: usize          = HEADER_SIZE + RING_BUFFER_SIZE; // 66,048
+
+pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Sender<AudioCommand>) {
     let shm_file_path = Path::new(&shm_path);
     let _tmp_dir = shm_file_path.parent().expect("Invalid SHM path parent directory");
 
@@ -63,6 +78,7 @@ pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: S
 
     println!("[Rust Daemon] SHM Control Loop active.");
     let mut local_read_seq = 0;
+    let mut local_voxel_version = 0;
 
     let mut last_pos = [0.0f32; 3];
     let mut last_fwd = [0.0f32; 3];
@@ -72,7 +88,7 @@ pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: S
     let mut last_dev_seq = 0u32;
 
     loop {
-        let java_write_seq = LittleEndian::read_u32(&mmap[0..4]);
+        let java_write_seq = LittleEndian::read_u32(&mmap[OFFSET_JAVA_WRITE_SEQ .. OFFSET_JAVA_WRITE_SEQ + 4]);
 
         if java_write_seq.saturating_sub(local_read_seq) > QUEUE_CAPACITY as u32 {
             local_read_seq = java_write_seq;
@@ -83,14 +99,16 @@ pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: S
         let mut listener_up = [0.0f32; 3];
         let mut category_volumes = [1.0f32; 16];
 
-        let mut ver = LittleEndian::read_u32(&mmap[8..12]);
+        let mut ver = LittleEndian::read_u32(&mmap[OFFSET_VER .. OFFSET_VER + 4]);
         let mut attempts = 0;
 
         while ver % 2 != 0 && attempts < 100 {
             std::hint::spin_loop();
-            ver = LittleEndian::read_u32(&mmap[8..12]);
+            ver = LittleEndian::read_u32(&mmap[OFFSET_VER .. OFFSET_VER + 4]);
             attempts += 1;
         }
+
+        compiler_fence(Ordering::Acquire);
 
         for idx in 0..3 {
             listener_pos[idx] = LittleEndian::read_f32(&mmap[12 + idx * 4 .. 16 + idx * 4]);
@@ -105,7 +123,8 @@ pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: S
 
         let engine_flags = LittleEndian::read_u32(&mmap[112..116]);
 
-        let ver_check = LittleEndian::read_u32(&mmap[8..12]);
+        compiler_fence(Ordering::Release);
+        let ver_check = LittleEndian::read_u32(&mmap[OFFSET_VER .. OFFSET_VER + 4]);
 
         if ver == ver_check {
             if listener_pos != last_pos
@@ -129,10 +148,35 @@ pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: S
             }
         }
 
-        let dev_seq = LittleEndian::read_u32(&mmap[116..120]);
+        // Check if voxel grid changed
+        let voxel_version = LittleEndian::read_u32(&mmap[OFFSET_VOXEL_GRID_VERSION .. OFFSET_VOXEL_GRID_VERSION + 4]);
+        if voxel_version != local_voxel_version {
+            local_voxel_version = voxel_version;
+
+            let cx = LittleEndian::read_i32(&mmap[OFFSET_CENTER_X .. OFFSET_CENTER_X + 4]);
+            let cy = LittleEndian::read_i32(&mmap[OFFSET_CENTER_Y .. OFFSET_CENTER_Y + 4]);
+            let cz = LittleEndian::read_i32(&mmap[OFFSET_CENTER_Z .. OFFSET_CENTER_Z + 4]);
+
+            // Read raw bytes representing the grid from mapped memory
+            let mut voxel_bytes = [0u8; 32768];
+            voxel_bytes.copy_from_slice(&mmap[OFFSET_VOXEL_GRID .. OFFSET_VOXEL_GRID + 32768]);
+
+            // Spawn CPU-heavy geometry processing off the control thread
+            let app_state_task = Arc::clone(&app_state);
+            tokio::task::spawn_blocking(move || {
+                crate::phonon::rebuild_acoustic_mesh(
+                    app_state_task.scene,
+                    app_state_task.context,
+                    &voxel_bytes,
+                    [cx, cy, cz]
+                );
+            });
+        }
+
+        let dev_seq = LittleEndian::read_u32(&mmap[OFFSET_DEV_SEQ .. OFFSET_DEV_SEQ + 4]);
         if dev_seq != last_dev_seq {
             let mut name_bytes = vec![0u8; 128];
-            name_bytes.copy_from_slice(&mmap[120..248]);
+            name_bytes.copy_from_slice(&mmap[OFFSET_DEV_NAME .. OFFSET_DEV_NAME + 128]);
 
             let len = name_bytes.iter().position(|&x| x == 0).unwrap_or(128);
             let dev_name = String::from_utf8_lossy(&name_bytes[..len]).into_owned();
@@ -178,7 +222,7 @@ pub async fn run_ipc_loop(shm_path: String, _app_state: Arc<AppState>, tx_cmd: S
             }
 
             local_read_seq += 1;
-            LittleEndian::write_u32(&mut mmap[4..8], local_read_seq);
+            LittleEndian::write_u32(&mut mmap[OFFSET_RUST_READ_SEQ .. OFFSET_RUST_READ_SEQ + 4], local_read_seq);
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;

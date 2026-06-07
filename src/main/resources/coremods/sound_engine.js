@@ -1,7 +1,134 @@
 function initializeCoreMod() {
-    print("[Decibel CoreMod] Initializing JavaScript CoreMod...");
+    print("[Decibel CoreMod] Initializing JavaScript CoreMod with Negative Space Protection...");
 
     return {
+        // CoreMod 1: CLASS-Level OpenAL Obliteration
+        'decibel_openal_obliteration': {
+            'target': {
+                'type': 'CLASS',
+                'name': 'com.mojang.blaze3d.audio.Library'
+            },
+            'transformer': function(classNode) {
+                var Opcodes = Java.type('org.objectweb.asm.Opcodes');
+                var InsnList = Java.type('org.objectweb.asm.tree.InsnList');
+                var VarInsnNode = Java.type('org.objectweb.asm.tree.VarInsnNode');
+                var TypeInsnNode = Java.type('org.objectweb.asm.tree.TypeInsnNode');
+                var InsnNode = Java.type('org.objectweb.asm.tree.InsnNode');
+                var IntInsnNode = Java.type('org.objectweb.asm.tree.IntInsnNode');
+                var MethodInsnNode = Java.type('org.objectweb.asm.tree.MethodInsnNode');
+                var FieldInsnNode = Java.type('org.objectweb.asm.tree.FieldInsnNode');
+
+                print("[Decibel CoreMod] Executing CLASS-level OpenAL context bypass...");
+
+                // 1. Procedural Name Discovery
+                // Rather than hardcoding mapped or SRG obfuscated names, we scan descriptors.
+                var channelPoolFields = [];
+                var longFields = [];
+                for (var i = 0; i < classNode.fields.size(); i++) {
+                    var field = classNode.fields.get(i);
+                    var desc = field.desc;
+                    if (desc.indexOf("ChannelPool") !== -1) {
+                        channelPoolFields.push(field);
+                    } else if (desc === "J") {
+                        longFields.push(field);
+                    }
+                }
+
+                // 2. Find target methods
+                var initMethod = null;
+                var cleanupMethod = null;
+                for (var i = 0; i < classNode.methods.size(); i++) {
+                    var m = classNode.methods.get(i);
+                    if (m.name === "init" && m.desc === "(Ljava/lang/String;Z)V") {
+                        initMethod = m;
+                    } else if (m.name === "cleanup" && m.desc === "()V") {
+                        cleanupMethod = m;
+                    }
+                }
+
+                if (initMethod !== null) {
+                    print("[Decibel CoreMod] Stubbing Library.init() procedurally...");
+
+                    // Statically extract the correct name of the CountingChannelPool class from original instructions
+                    var countingChannelPoolClass = "com/mojang/blaze3d/audio/Library$CountingChannelPool";
+                    for (var j = 0; j < initMethod.instructions.size(); j++) {
+                        var insn = initMethod.instructions.get(j);
+                        if (insn.getOpcode() === Opcodes.NEW) {
+                            countingChannelPoolClass = insn.desc;
+                            break;
+                        }
+                    }
+
+                    var newInstructions = new InsnList();
+
+                    // Instantiate both static and streaming channel pools to prevent NPEs in getDebugString()
+                    for (var k = 0; k < channelPoolFields.length; k++) {
+                        var poolField = channelPoolFields[k];
+                        var limit = (k === 0) ? 30 : 8; // standard vanilla pool sizes
+
+                        newInstructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                        newInstructions.add(new TypeInsnNode(Opcodes.NEW, countingChannelPoolClass));
+                        newInstructions.add(new InsnNode(Opcodes.DUP));
+                        newInstructions.add(new IntInsnNode(Opcodes.BIPUSH, limit));
+                        newInstructions.add(new MethodInsnNode(
+                            Opcodes.INVOKESPECIAL,
+                            countingChannelPoolClass,
+                            "<init>",
+                            "(I)V",
+                            false
+                        ));
+                        newInstructions.add(new FieldInsnNode(
+                            Opcodes.PUTFIELD,
+                            "com/mojang/blaze3d/audio/Library",
+                            poolField.name,
+                            poolField.desc,
+                            false
+                        ));
+                    }
+
+                    // Set dummy handles (1L) for currentDevice and context so status checks (e.g. context != 0L) pass
+                    for (var l = 0; l < longFields.length; l++) {
+                        var longField = longFields[l];
+                        newInstructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                        newInstructions.add(new InsnNode(Opcodes.LCONST_1));
+                        newInstructions.add(new FieldInsnNode(
+                            Opcodes.PUTFIELD,
+                            "com/mojang/blaze3d/audio/Library",
+                            longField.name,
+                            longField.desc,
+                            false
+                        ));
+                    }
+
+                    newInstructions.add(new InsnNode(Opcodes.RETURN));
+
+                    // FIX: Safely clear out exception handlers and local variables to prevent computeAllFrames from throwing NPEs
+                    initMethod.tryCatchBlocks.clear();
+                    if (initMethod.localVariables !== null) {
+                        initMethod.localVariables.clear();
+                    }
+                    initMethod.instructions.clear();
+                    initMethod.instructions.add(newInstructions);
+                }
+
+                if (cleanupMethod !== null) {
+                    print("[Decibel CoreMod] Stubbing Library.cleanup() cleanly...");
+                    var cleanupInstructions = new InsnList();
+                    cleanupInstructions.add(new InsnNode(Opcodes.RETURN));
+
+                    cleanupMethod.tryCatchBlocks.clear();
+                    if (cleanupMethod.localVariables !== null) {
+                        cleanupMethod.localVariables.clear();
+                    }
+                    cleanupMethod.instructions.clear();
+                    cleanupMethod.instructions.add(cleanupInstructions);
+                }
+
+                return classNode;
+            }
+        },
+
+        // CoreMod 2: SoundEngine Play Interception (Method-Level)
         'decibel_sound_bypass': {
             'target': {
                 'type': 'METHOD',
@@ -20,6 +147,11 @@ function initializeCoreMod() {
 
                 print("[Decibel CoreMod] Splicing net.minecraft.client.sounds.SoundEngine.play()...");
 
+                if (methodNode.desc !== "(Lnet/minecraft/client/resources/sounds/SoundInstance;)V") {
+                    print("[Decibel CoreMod] WARNING: SoundEngine.play descriptor mismatch. Skipping override.");
+                    return methodNode;
+                }
+
                 var instructions = new InsnList();
                 instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
                 instructions.add(new MethodInsnNode(
@@ -31,6 +163,8 @@ function initializeCoreMod() {
                 ));
 
                 var label = new LabelNode();
+                // Pass-through Negative Space Check: If onPlaySound returns false (e.g. daemon is booting or dead),
+                // it falls back to vanilla context execution, ensuring simple sound compatibility.
                 instructions.add(new JumpInsnNode(Opcodes.IFEQ, label));
                 instructions.add(new InsnNode(Opcodes.RETURN));
                 instructions.add(label);
@@ -39,6 +173,7 @@ function initializeCoreMod() {
                 return methodNode;
             }
         },
+
         'decibel_sound_stop': {
             'target': {
                 'type': 'METHOD',
@@ -56,6 +191,10 @@ function initializeCoreMod() {
                 var InsnList = Java.type('org.objectweb.asm.tree.InsnList');
 
                 print("[Decibel CoreMod] Splicing net.minecraft.client.sounds.SoundEngine.stop()...");
+
+                if (methodNode.desc !== "(Lnet/minecraft/client/resources/sounds/SoundInstance;)V") {
+                    return methodNode;
+                }
 
                 var instructions = new InsnList();
                 instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
@@ -76,6 +215,7 @@ function initializeCoreMod() {
                 return methodNode;
             }
         },
+
         'decibel_listener_update': {
             'target': {
                 'type': 'METHOD',
@@ -91,6 +231,10 @@ function initializeCoreMod() {
 
                 print("[Decibel CoreMod] Splicing net.minecraft.client.sounds.SoundEngine.updateSource()...");
 
+                if (methodNode.desc !== "(Lnet/minecraft/client/Camera;)V") {
+                    return methodNode;
+                }
+
                 var instructions = new InsnList();
                 instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
                 instructions.add(new MethodInsnNode(
@@ -105,6 +249,7 @@ function initializeCoreMod() {
                 return methodNode;
             }
         },
+
         'decibel_sound_stop_all': {
             'target': {
                 'type': 'METHOD',
@@ -132,6 +277,7 @@ function initializeCoreMod() {
                 return methodNode;
             }
         },
+
         'decibel_sound_destroy': {
             'target': {
                 'type': 'METHOD',
@@ -159,5 +305,5 @@ function initializeCoreMod() {
                 return methodNode;
             }
         }
-    }
+    };
 }

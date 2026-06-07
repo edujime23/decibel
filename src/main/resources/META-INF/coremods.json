@@ -1,3 +1,4 @@
 {
+  "decibel_openal_obliteration": "coremods/sound_engine.js",
   "decibel_sound_bypass": "coremods/sound_engine.js"
 }

@@ -1,13 +1,13 @@
 mod ipc;
 mod audio;
-mod steam;
+mod phonon;
 mod asset;
 
 use std::env;
 use std::sync::Arc;
 use std::thread;
 use crossbeam_channel::unbounded;
-use cpal::traits::{DeviceTrait, HostTrait}; // Removed StreamTrait
+use cpal::traits::{DeviceTrait, HostTrait};
 
 #[allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
 pub mod steam_audio {
@@ -17,6 +17,7 @@ pub mod steam_audio {
 pub struct AppState {
     pub context: steam_audio::IPLContext,
     pub hrtf: steam_audio::IPLHRTF,
+    pub scene: steam_audio::IPLScene,
 }
 
 unsafe impl Send for AppState {}
@@ -81,7 +82,28 @@ async fn main() {
     }
     println!("[Rust Daemon] Steam Audio HRTF created successfully!");
 
-    let app_state = Arc::new(AppState { context, hrtf });
+    // Instantiate and register the global Scene structure to handle acoustic raycasts
+    let mut scene: steam_audio::IPLScene = std::ptr::null_mut();
+    let mut scene_settings = steam_audio::IPLSceneSettings {
+        type_: steam_audio::IPLSceneType_IPL_SCENETYPE_DEFAULT,
+        closestHitCallback: None,
+        anyHitCallback: None,
+        batchedClosestHitCallback: None,
+        batchedAnyHitCallback: None,
+        userData: std::ptr::null_mut(),
+        embreeDevice: std::ptr::null_mut(),
+        radeonRaysDevice: std::ptr::null_mut(),
+    };
+
+    unsafe {
+        let status = steam_audio::iplSceneCreate(context, &mut scene_settings, &mut scene);
+        if status != steam_audio::IPLerror_IPL_STATUS_SUCCESS {
+            panic!("Failed to create IPLScene! Error Code: {}", status);
+        }
+    }
+    println!("[Rust Daemon] Steam Audio IPLScene created successfully!");
+
+    let app_state = Arc::new(AppState { context, hrtf, scene });
     let (tx_cmd, rx_cmd) = unbounded::<audio::AudioCommand>();
 
     let app_state_audio = Arc::clone(&app_state);
