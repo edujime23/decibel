@@ -7,6 +7,9 @@ import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
 import net.neoforged.neoforge.client.gui.ConfigurationScreen;
 import net.neoforged.neoforge.client.gui.IConfigScreenFactory;
 
+import com.edujime23.decibel.daemon.DaemonManager;
+import com.edujime23.decibel.voxels.ClientTickHandler;
+
 @Mod(value = Decibel.MODID, dist = Dist.CLIENT)
 public class DecibelClient {
 
@@ -14,7 +17,6 @@ public class DecibelClient {
         container.registerExtensionPoint(IConfigScreenFactory.class, ConfigurationScreen::new);
         container.getEventBus().addListener(this::onClientSetup);
 
-        // Register the client tick handler to synchronize state in menus
         net.neoforged.neoforge.common.NeoForge.EVENT_BUS.register(ClientTickHandler.class);
     }
 

@@ -2,7 +2,7 @@ package com.edujime23.decibel.asm;
 
 import com.edujime23.decibel.AssetCacher;
 import com.edujime23.decibel.Config;
-import com.edujime23.decibel.DaemonManager;
+import com.edujime23.decibel.daemon.DaemonManager;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.resources.sounds.SoundInstance;
@@ -22,31 +22,28 @@ public class SoundInterceptor {
     private static final Logger LOGGER = LoggerFactory.getLogger("Decibel-Interceptor");
     private static final java.util.concurrent.atomic.AtomicInteger soundIdGenerator = new java.util.concurrent.atomic.AtomicInteger(1);
 
-    // Solves Memory Leak: Using WeakHashMap prevents holding strong references to transient sounds
     private static final Map<SoundInstance, Integer> activeSoundUids = Collections.synchronizedMap(new WeakHashMap<>());
 
     public static boolean onPlaySound(SoundInstance sound) {
-        if (sound == null) {
-            return false;
-        }
+        if (sound == null) return false;
 
         try {
+            String className = sound.getClass().getName();
+            if (className.contains("SpeakerSound") || className.contains("Speaker") || className.contains("Dfpwm")) {
+                return false;
+            }
+
             if (sound.getSound() == null) {
                 WeighedSoundEvents resolved = sound.resolve(Minecraft.getInstance().getSoundManager());
-                if (resolved == null || sound.getSound() == null) {
-                    return false;
-                }
+                if (resolved == null || sound.getSound() == null) return false;
             }
 
             Sound soundRecord = sound.getSound();
 
-            if (DaemonManager.ipc == null) {
-                return false;
-            }
+            if (DaemonManager.ipc == null) return false;
 
             float baseVolume = sound.getVolume();
             float pitch = sound.getPitch();
-
             boolean relative = sound.isRelative();
             boolean spatial = sound.getAttenuation() != SoundInstance.Attenuation.NONE;
 
@@ -55,9 +52,7 @@ public class SoundInterceptor {
                 spatial = true;
             }
 
-            if (baseVolume <= 0.0001f) {
-                return true;
-            }
+            if (baseVolume <= 0.0001f) return true;
 
             int uid = soundIdGenerator.incrementAndGet();
             activeSoundUids.put(sound, uid);
@@ -71,11 +66,9 @@ public class SoundInterceptor {
 
             int categoryId = sound.getSource().ordinal();
 
-            boolean sent = DaemonManager.ipc.writePlayEvent(
+            return DaemonManager.ipc.writePlayEvent(
                 uid, x, y, z, baseVolume, pitch, assetHash, relative, spatial, categoryId
             );
-            return sent;
-
         } catch (Throwable t) {
             LOGGER.error("Failed to process sound in interceptor", t);
             return false;
@@ -83,9 +76,7 @@ public class SoundInterceptor {
     }
 
     public static boolean onStopSound(SoundInstance sound) {
-        if (sound == null || DaemonManager.ipc == null) {
-            return false;
-        }
+        if (sound == null || DaemonManager.ipc == null) return false;
         try {
             Integer uid = activeSoundUids.remove(sound);
             if (uid != null) {
@@ -97,15 +88,8 @@ public class SoundInterceptor {
         return false;
     }
 
-    /**
-     * Standard SoundEngine cleanup hook.
-     * Retains the level == null safety guard to prevent options/video settings reloads
-     * from silencing playing Jukebox tracks mid-game.
-     */
     public static void onStopAll() {
-        if (DaemonManager.ipc == null) {
-            return;
-        }
+        if (DaemonManager.ipc == null) return;
         try {
             if (Minecraft.getInstance().level == null) {
                 forceStopAll();
@@ -115,14 +99,8 @@ public class SoundInterceptor {
         }
     }
 
-    /**
-     * Forces immediate stops of all active tracking registries and pushes the stop opcode to the daemon.
-     * Used on true world disconnects and portal/dimension travel.
-     */
     public static void forceStopAll() {
-        if (DaemonManager.ipc == null) {
-            return;
-        }
+        if (DaemonManager.ipc == null) return;
         try {
             activeSoundUids.clear();
             DaemonManager.ipc.writeStopAllEvent();
@@ -132,9 +110,7 @@ public class SoundInterceptor {
     }
 
     public static void onUpdateListener(Camera camera) {
-        if (camera == null || DaemonManager.ipc == null) {
-            return;
-        }
+        if (camera == null || DaemonManager.ipc == null) return;
         try {
             Vec3 pos = camera.getPosition();
             Vector3f fwd = camera.getLookVector();
@@ -151,9 +127,7 @@ public class SoundInterceptor {
     }
 
     public static void syncGlobalState() {
-        if (DaemonManager.ipc == null || Minecraft.getInstance() == null || Minecraft.getInstance().options == null) {
-            return;
-        }
+        if (DaemonManager.ipc == null || Minecraft.getInstance() == null || Minecraft.getInstance().options == null) return;
         try {
             float[] categoryVols = new float[16];
             for (SoundSource source : SoundSource.values()) {
@@ -175,8 +149,6 @@ public class SoundInterceptor {
 
             String currentDevice = Minecraft.getInstance().options.soundDevice().get();
             DaemonManager.ipc.updateOutputDevice(currentDevice);
-        } catch (Throwable t) {
-            // Ignore during setup/shutdown sequence
-        }
+        } catch (Throwable t) {}
     }
 }

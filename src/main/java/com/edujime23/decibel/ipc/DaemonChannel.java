@@ -1,7 +1,6 @@
 package com.edujime23.decibel.ipc;
 
 import com.edujime23.decibel.Decibel;
-import java.io.File;
 import java.io.RandomAccessFile;
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
@@ -76,6 +75,62 @@ public class DaemonChannel {
             }
         } catch (Exception e) {
             Decibel.LOGGER.error("Failed to send asset over Native Signal Channel", e);
+        }
+    }
+
+    public synchronized void sendPlayStream(int uid, float x, float y, float z, float volume, float pitch, boolean relative, boolean spatial, int categoryId, int sampleRate, int channels) {
+        try {
+            int payloadSize = 28;
+            ByteBuffer packet = ByteBuffer.allocate(13 + payloadSize);
+            packet.order(ByteOrder.LITTLE_ENDIAN);
+            packet.put("DCBL".getBytes());
+            packet.put((byte) 0x02); // OP_PLAY_STREAM
+            packet.putInt(uid);
+            packet.putInt(payloadSize);
+
+            packet.putFloat(x);
+            packet.putFloat(y);
+            packet.putFloat(z);
+            packet.putFloat(volume);
+            packet.putFloat(pitch);
+            packet.put((byte) (relative ? 1 : 0));
+            packet.put((byte) (spatial ? 1 : 0));
+            packet.put((byte) categoryId);
+
+            packet.putInt(sampleRate);
+            packet.put((byte) channels);
+
+            if (isWindows) {
+                windowsPipe.write(packet.array());
+            } else {
+                unixSocket.write(ByteBuffer.wrap(packet.array()));
+            }
+        } catch (Exception e) {
+            Decibel.LOGGER.error("Failed to send play stream command over Native Signal Channel", e);
+        }
+    }
+
+    public synchronized void sendStreamData(int uid, float[] samples) {
+        try {
+            int payloadSize = samples.length * 4;
+            ByteBuffer packet = ByteBuffer.allocate(13 + payloadSize);
+            packet.order(ByteOrder.LITTLE_ENDIAN);
+            packet.put("DCBL".getBytes());
+            packet.put((byte) 0x03); // OP_STREAM_DATA
+            packet.putInt(uid);
+            packet.putInt(payloadSize);
+
+            for (float sample : samples) {
+                packet.putFloat(sample);
+            }
+
+            if (isWindows) {
+                windowsPipe.write(packet.array());
+            } else {
+                unixSocket.write(ByteBuffer.wrap(packet.array()));
+            }
+        } catch (Exception e) {
+            Decibel.LOGGER.error("Failed to send stream data packet over Native Signal Channel", e);
         }
     }
 

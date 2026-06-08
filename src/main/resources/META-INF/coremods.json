@@ -1,8 +1,6 @@
 {
-  "decibel_openal_obliteration": "coremods/sound_engine.js",
-  "decibel_sound_bypass": "coremods/sound_engine.js",
-  "decibel_sound_stop": "coremods/sound_engine.js",
-  "decibel_listener_update": "coremods/sound_engine.js",
-  "decibel_sound_stop_all": "coremods/sound_engine.js",
-  "decibel_sound_destroy": "coremods/sound_engine.js"
+  "decibel_library_transformer": "coremods/library_transformer.js",
+  "decibel_listener_transformer": "coremods/listener_transformer.js",
+  "decibel_channel_transformer": "coremods/channel_transformer.js",
+  "decibel_sound_engine_transformer": "coremods/sound_engine_transformer.js"
 }

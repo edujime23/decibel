@@ -1,5 +1,8 @@
-package com.edujime23.decibel;
+package com.edujime23.decibel.daemon;
 
+import com.edujime23.decibel.AssetCacher;
+import com.edujime23.decibel.Decibel;
+import com.edujime23.decibel.MaterialRegistry;
 import com.edujime23.decibel.ipc.DaemonChannel;
 import com.edujime23.decibel.ipc.SharedMemoryRingBuffer;
 import org.slf4j.Logger;
@@ -76,7 +79,7 @@ public class DaemonManager {
                 }
             }));
 
-            startWatchdog();
+            DaemonWatchdog.start(daemonProcess);
 
         } catch (Exception e) {
             LOGGER.error("CRITICAL FAILURE: Could not boot Steam Audio Daemon!", e);
@@ -91,19 +94,5 @@ public class DaemonManager {
             }
             Files.copy(is, targetPath, StandardCopyOption.REPLACE_EXISTING);
         }
-    }
-
-    private static void startWatchdog() {
-        Thread watchdog = new Thread(() -> {
-            try {
-                int exitCode = daemonProcess.waitFor();
-                LOGGER.error("DAEMON DIED with exit code {}. Audio suspended.", exitCode);
-            } catch (InterruptedException e) {
-                LOGGER.warn("Watchdog thread interrupted.");
-            }
-        });
-        watchdog.setDaemon(true);
-        watchdog.setName("Decibel-Watchdog");
-        watchdog.start();
     }
 }
