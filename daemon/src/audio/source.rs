@@ -23,17 +23,7 @@ pub struct ActiveSound {
     pub is_relative: bool,
     pub is_spatial: bool,
     pub category_id: usize,
-    pub direct_effect: phonon::SteamDirectEffect,
-    pub binaural_effect: phonon::SteamBinauralEffect,
-}
-
-pub struct DeferredPlay {
-    pub uid: u32,
-    pub pos: [f32; 3],
-    pub volume: f32,
-    pub pitch: f32,
-    pub asset_hash: u32,
-    pub is_relative: bool,
-    pub is_spatial: bool,
-    pub category_id: usize,
+    pub direct_effect: Option<phonon::SteamDirectEffect>,
+    pub binaural_effect: Option<phonon::SteamBinauralEffect>,
+    pub ipl_source: Option<phonon::SteamSource>,
 }

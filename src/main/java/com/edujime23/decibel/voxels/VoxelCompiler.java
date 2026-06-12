@@ -1,12 +1,14 @@
 package com.edujime23.decibel.voxels;
 
 import com.edujime23.decibel.daemon.DaemonManager;
-import com.edujime23.decibel.MaterialRegistry; // <--- The missing import!
+import com.edujime23.decibel.MaterialRegistry;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.core.registries.BuiltInRegistries;
+
 import java.util.Locale;
+import java.util.concurrent.CompletableFuture;
 
 public class VoxelCompiler {
     private static final byte[] VOXEL_CACHE = new byte[64 * 64 * 64];
@@ -19,37 +21,41 @@ public class VoxelCompiler {
             currentSliceX = 0;
         }
 
-        int startX = lastCenterPos.getX() - 32;
-        int startY = lastCenterPos.getY() - 32;
-        int startZ = lastCenterPos.getZ() - 32;
+        final int sliceToProcess = currentSliceX;
+        final int startX = lastCenterPos.getX() - 32;
+        final int startY = lastCenterPos.getY() - 32;
+        final int startZ = lastCenterPos.getZ() - 32;
 
-        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        // Negative Space Fix: Offload chunk reading to avoid 16,000 main-thread blocks.
+        CompletableFuture.runAsync(() -> {
+            BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+            for (int i = 0; i < 4; i++) {
+                int x = (sliceToProcess + i) % 64;
+                int worldX = startX + x;
 
-        for (int i = 0; i < 4; i++) {
-            int x = (currentSliceX + i) % 64;
-            int worldX = startX + x;
+                for (int y = 0; y < 64; y++) {
+                    int worldY = startY + y;
+                    for (int z = 0; z < 64; z++) {
+                        int worldZ = startZ + z;
+                        pos.set(worldX, worldY, worldZ);
 
-            for (int y = 0; y < 64; y++) {
-                int worldY = startY + y;
-                for (int z = 0; z < 64; z++) {
-                    int worldZ = startZ + z;
-                    pos.set(worldX, worldY, worldZ);
+                        if (!level.hasChunkAt(pos)) {
+                            VOXEL_CACHE[(x * 4096) + (y * 64) + z] = 0;
+                            continue;
+                        }
 
-                    if (level.hasChunkAt(pos)) {
                         BlockState state = level.getBlockState(pos);
                         VOXEL_CACHE[(x * 4096) + (y * 64) + z] = getAcousticMaterialId(state);
-                    } else {
-                        VOXEL_CACHE[(x * 4096) + (y * 64) + z] = 0;
                     }
                 }
             }
-        }
+        }).thenRun(() -> {
+            if (sliceToProcess + 4 >= 64 && DaemonManager.ipc != null) {
+                DaemonManager.ipc.updateVoxelGrid(VOXEL_CACHE, startX, startY, startZ);
+            }
+        });
 
         currentSliceX = (currentSliceX + 4) % 64;
-
-        if (currentSliceX == 0) {
-            DaemonManager.ipc.updateVoxelGrid(VOXEL_CACHE, startX, startY, startZ);
-        }
     }
 
     public static void reset() {

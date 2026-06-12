@@ -68,7 +68,11 @@ public class VirtualChannel {
     public static void setLooping(Object channelRef, boolean looping) { get(channelRef).looping = looping; }
     public static void setRelative(Object channelRef, boolean relative) { get(channelRef).relative = relative; }
     public static void pumpBuffers(Object channelRef, int count) { get(channelRef).pumpBuffers(count); }
-    public static void updateStream(Object channelRef) { /* No-op, handled by pumpBuffers */ }
+    public static void updateStream(Object channelRef) {
+        VirtualChannel vc = activeChannels.get(channelRef);
+        if (vc == null || !vc.playing || !vc.isStream) return;
+        vc.pumpBuffers(1);
+    }
 
     public void attachBufferStream(AudioStream stream) {
         this.stream = stream;
@@ -118,19 +122,19 @@ public class VirtualChannel {
         if (!this.playing || stream == null || DaemonManager.channel == null) return;
         try {
             AudioFormat format = stream.getFormat();
+            if (format == null) return;
+
             int sampleSize = format.getSampleSizeInBits();
             boolean bigEndian = format.isBigEndian();
 
             for (int i = 0; i < count; i++) {
-                // BUG FIX: Prevent buffer starvation by reading enough data to survive MC ticks
                 ByteBuffer bytes = stream.read(8192);
                 if (bytes == null || !bytes.hasRemaining()) break;
 
                 byte[] data = new byte[bytes.remaining()];
                 bytes.get(data);
-                float[] floats;
 
-                // BUG FIX: Format correctly using standard AudioFormat traits
+                float[] floats;
                 if (sampleSize == 8) {
                     floats = new float[data.length];
                     for (int idx = 0; idx < data.length; idx++) {
@@ -146,10 +150,14 @@ public class VirtualChannel {
                     }
                 }
 
-                DaemonManager.channel.sendStreamData(uid, floats);
+                if (floats.length > 0) {
+                    DaemonManager.channel.sendStreamData(uid, floats);
+                }
             }
         } catch (Exception e) {
-            Decibel.LOGGER.error("Failed to pump virtual channel stream", e);
+            // Log once and suppress to avoid console spam lag
+            this.playing = false;
+            Decibel.LOGGER.error("Stream pump failed, disabling virtual channel stream", e);
         }
     }
 }

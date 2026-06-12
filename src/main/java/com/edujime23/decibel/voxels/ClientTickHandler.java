@@ -11,11 +11,14 @@ import net.neoforged.neoforge.event.level.LevelEvent;
 public class ClientTickHandler {
     @SubscribeEvent
     public static void onClientTick(ClientTickEvent.Post event) {
+        if (DaemonManager.ipc == null) return;
+
         SoundInterceptor.syncGlobalState();
+
         Minecraft mc = Minecraft.getInstance();
-        if (mc.player != null && mc.level != null && DaemonManager.ipc != null) {
-            VoxelCompiler.tick(mc.player.blockPosition(), mc.level);
-        }
+        if (mc.player == null || mc.level == null) return;
+
+        VoxelCompiler.tick(mc.player.blockPosition(), mc.level);
     }
 
     @SubscribeEvent
@@ -26,9 +29,8 @@ public class ClientTickHandler {
 
     @SubscribeEvent
     public static void onLevelUnload(LevelEvent.Unload event) {
-        if (event.getLevel().isClientSide()) {
-            SoundInterceptor.forceStopAll();
-            VoxelCompiler.reset();
-        }
+        if (!event.getLevel().isClientSide()) return;
+        SoundInterceptor.forceStopAll();
+        VoxelCompiler.reset();
     }
 }

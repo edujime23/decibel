@@ -8,6 +8,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 
 public class AssetCacher {
     private static final ConcurrentHashMap<Integer, Boolean> cachedAssets = new ConcurrentHashMap<>();
@@ -19,37 +20,28 @@ public class AssetCacher {
     }
 
     public static void ensureCached(ResourceLocation soundLocation, int assetHash) {
-        if (cachedAssets.containsKey(assetHash)) return;
+        if (cachedAssets.containsKey(assetHash) || channel == null) return;
+        cachedAssets.put(assetHash, true); // Mark active immediately to prevent spam
 
-        ResourceLocation oggLocation = ResourceLocation.fromNamespaceAndPath(
-            soundLocation.getNamespace(),
-            "sounds/" + soundLocation.getPath() + ".ogg"
-        );
+        ResourceLocation oggLocation = ResourceLocation.fromNamespaceAndPath(soundLocation.getNamespace(), "sounds/" + soundLocation.getPath() + ".ogg");
 
-        try {
-            Optional<Resource> resource = Minecraft.getInstance().getResourceManager().getResource(oggLocation);
+        // Negative Space Fix: Completely async file streaming prevents Minecraft freeze on large tracks
+        CompletableFuture.runAsync(() -> {
+            try {
+                Optional<Resource> resource = Minecraft.getInstance().getResourceManager().getResource(oggLocation);
+                if (resource.isEmpty()) return;
 
-            if (resource.isPresent()) {
                 try (InputStream is = resource.get().open()) {
                     ByteArrayOutputStream bos = new ByteArrayOutputStream();
                     byte[] buf = new byte[8192];
                     int len;
-                    while ((len = is.read(buf)) != -1) {
-                        bos.write(buf, 0, len);
-                    }
-                    byte[] rawOggBytes = bos.toByteArray();
-
-                    if (channel != null) {
-                        channel.sendAsset(assetHash, rawOggBytes);
-                        cachedAssets.put(assetHash, true);
-                        Decibel.LOGGER.info("Decibel Streamed Diskless Asset: {} ({} bytes)", oggLocation, rawOggBytes.length);
-                    }
+                    while ((len = is.read(buf)) != -1) bos.write(buf, 0, len);
+                    channel.sendAsset(assetHash, bos.toByteArray());
                 }
-            } else {
-                Decibel.LOGGER.warn("Could not find OGG resource: {}", oggLocation);
+            } catch (Exception e) {
+                Decibel.LOGGER.error("Failed to stream asset: {}", oggLocation, e);
+                cachedAssets.remove(assetHash);
             }
-        } catch (Exception e) {
-            Decibel.LOGGER.error("Failed to stream asset: {}", oggLocation, e);
-        }
+        });
     }
 }

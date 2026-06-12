@@ -1,10 +1,10 @@
 package com.edujime23.decibel.daemon;
 
 import com.edujime23.decibel.AssetCacher;
-import com.edujime23.decibel.Decibel;
 import com.edujime23.decibel.MaterialRegistry;
 import com.edujime23.decibel.ipc.DaemonChannel;
 import com.edujime23.decibel.ipc.SharedMemoryRingBuffer;
+import net.neoforged.fml.loading.FMLPaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -12,7 +12,6 @@ import java.io.File;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.Locale;
 
@@ -25,61 +24,57 @@ public class DaemonManager {
     public static void init() {
         try {
             LOGGER.info("Initializing Decibel Out-of-Process Audio Engine...");
-
             MaterialRegistry.init();
 
             String osName = System.getProperty("os.name").toLowerCase(Locale.ROOT);
             boolean isWindows = osName.contains("win");
             boolean isMac = osName.contains("mac");
 
-            Path tmpDir = Paths.get(System.getProperty("java.io.tmpdir"), "decibel_engine");
-            Files.createDirectories(tmpDir);
+            Path nativeDir = FMLPaths.GAMEDIR.get().resolve("decibel_natives");
+            Files.createDirectories(nativeDir);
 
-            File shmFile = tmpDir.resolve("decibel_shm.dat").toFile();
+            File shmFile = nativeDir.resolve("decibel_shm.dat").toFile();
             ipc = new SharedMemoryRingBuffer(shmFile);
-            LOGGER.info("Shared Memory Ring Buffer mapped at: {}", shmFile.getAbsolutePath());
-
-            channel = new DaemonChannel(tmpDir, isWindows);
+            channel = new DaemonChannel(nativeDir, isWindows);
             AssetCacher.init(channel);
 
             String daemonName = isWindows ? "daemon.exe" : "daemon";
-            Path daemonPath = tmpDir.resolve(daemonName);
+            Path daemonPath = nativeDir.resolve(daemonName);
             extractResource("/bin/daemon/" + daemonName, daemonPath);
             daemonPath.toFile().setExecutable(true, true);
 
             if (isWindows) {
-                extractResource("/bin/steamaudio/windows/x64/phonon.dll", tmpDir.resolve("phonon.dll"));
-                extractResource("/bin/steamaudio/windows/x64/TrueAudioNext.dll", tmpDir.resolve("TrueAudioNext.dll"));
-                extractResource("/bin/steamaudio/windows/x64/GPUUtilities.dll", tmpDir.resolve("GPUUtilities.dll"));
+                extractResource("/bin/steamaudio/windows/x64/phonon.dll", nativeDir.resolve("phonon.dll"));
             } else if (isMac) {
-                extractResource("/bin/steamaudio/macos/libphonon.dylib", tmpDir.resolve("libphonon.dylib"));
+                extractResource("/bin/steamaudio/macos/libphonon.dylib", nativeDir.resolve("libphonon.dylib"));
             } else {
-                extractResource("/bin/steamaudio/linux/x64/libphonon.so", tmpDir.resolve("libphonon.so"));
+                extractResource("/bin/steamaudio/linux/x64/libphonon.so", nativeDir.resolve("libphonon.so"));
             }
 
             ProcessBuilder pb = new ProcessBuilder(daemonPath.toAbsolutePath().toString());
-            pb.directory(tmpDir.toFile());
-
+            pb.directory(nativeDir.toFile());
             pb.environment().put("DECIBEL_SHM_PATH", shmFile.getAbsolutePath());
-            pb.environment().put(isWindows ? "PATH" : "LD_LIBRARY_PATH", tmpDir.toAbsolutePath().toString());
-
+            String currentPath = pb.environment().getOrDefault("PATH", "");
+            pb.environment().put("PATH", nativeDir.toAbsolutePath().toString() + java.io.File.pathSeparator + currentPath);
             pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
             pb.redirectError(ProcessBuilder.Redirect.INHERIT);
 
             daemonProcess = pb.start();
             channel.connect();
-
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                if (daemonProcess != null && daemonProcess.isAlive()) {
-                    LOGGER.info("JVM shutting down. Terminating Rust Daemon...");
-                    daemonProcess.destroyForcibly();
-                }
-                if (channel != null) {
-                    channel.close();
-                }
-            }));
-
             DaemonWatchdog.start(daemonProcess);
+
+            // Flawless Dead-Man's Switch: Background Thread totally immune to Minecraft Loading Lag
+            Thread heartbeatThread = new Thread(() -> {
+                while (true) {
+                    try {
+                        Thread.sleep(1000); // 1 tick per second
+                        if (ipc != null) ipc.writeHeartbeat();
+                    } catch (InterruptedException e) { break; }
+                }
+            });
+            heartbeatThread.setDaemon(true); // Dies automatically when the JVM terminates
+            heartbeatThread.setName("Decibel-Heartbeat");
+            heartbeatThread.start();
 
         } catch (Exception e) {
             LOGGER.error("CRITICAL FAILURE: Could not boot Steam Audio Daemon!", e);
@@ -88,10 +83,7 @@ public class DaemonManager {
 
     private static void extractResource(String resourcePath, Path targetPath) throws Exception {
         try (InputStream is = DaemonManager.class.getResourceAsStream(resourcePath)) {
-            if (is == null) {
-                LOGGER.warn("Could not find resource inside JAR: " + resourcePath);
-                return;
-            }
+            if (is == null) return;
             Files.copy(is, targetPath, StandardCopyOption.REPLACE_EXISTING);
         }
     }

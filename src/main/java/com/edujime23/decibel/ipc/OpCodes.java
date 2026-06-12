@@ -1,6 +1,7 @@
 package com.edujime23.decibel.ipc;
 
 public class OpCodes {
+    public static final int OP_NONE = 255;
     public static final int OP_PLAY = 0;
     public static final int OP_STOP = 1;
     public static final int OP_STOP_ALL = 2;
