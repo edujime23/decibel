@@ -7,7 +7,6 @@ use super::source::{ActiveSound, AudioSource};
 use super::AudioCommand;
 
 const FRAME_SIZE: usize = 512;
-const MAX_STREAM_BUFFER: usize = 48000 * 3;
 
 #[cfg(windows)]
 extern "system" { fn CoInitializeEx(pvReserved: *mut std::ffi::c_void, dwCoInit: u32) -> i32; }
@@ -15,9 +14,7 @@ extern "system" { fn CoInitializeEx(pvReserved: *mut std::ffi::c_void, dwCoInit:
 struct PendingSound {
     uid: u32, pos: [f32; 3], volume: f32, pitch: f32, asset_hash: u32,
     is_relative: bool, is_spatial: bool, category_id: usize,
-    direct_effect: Option<crate::phonon::SteamDirectEffect>,
-    binaural_effect: Option<crate::phonon::SteamBinauralEffect>,
-    ipl_source: Option<crate::phonon::SteamSource>
+    direct_effect: Option<crate::phonon::SteamDirectEffect>, binaural_effect: Option<crate::phonon::SteamBinauralEffect>, ipl_source: Option<crate::phonon::SteamSource>
 }
 
 struct AudioState {
@@ -25,7 +22,10 @@ struct AudioState {
     pending_sounds: Vec<PendingSound>,
     asset_cache: HashMap<u32, crate::asset::PCMAsset>,
     stream_senders: HashMap<u32, crossbeam_channel::Sender<Vec<f32>>>,
-    listener_pos: [f32; 3], category_volumes: [f32; 16], engine_flags: u32,
+    listener_pos: [f32; 3],
+    listener_fwd: [f32; 3],
+    listener_up: [f32; 3],
+    category_volumes: [f32; 16], engine_flags: u32,
     accum_l: Vec<f32>, accum_r: Vec<f32>, resample_cursor: f32,
 }
 
@@ -37,7 +37,10 @@ pub fn run_audio_thread(device: cpal::Device, config: cpal::SupportedStreamConfi
 
     let mut state = AudioState {
         active_sounds: Vec::new(), pending_sounds: Vec::new(), asset_cache: HashMap::new(), stream_senders: HashMap::new(),
-        listener_pos: [0.0; 3], category_volumes: [1.0; 16], engine_flags: 0,
+        listener_pos: [0.0; 3],
+        listener_fwd: [0.0, 0.0, 1.0],
+        listener_up: [0.0, 1.0, 0.0],
+        category_volumes: [1.0; 16], engine_flags: 0,
         accum_l: Vec::new(), accum_r: Vec::new(), resample_cursor: 0.0,
     };
 
@@ -50,23 +53,11 @@ pub fn run_audio_thread(device: cpal::Device, config: cpal::SupportedStreamConfi
             while let Ok(cmd) = rx_cmd.try_recv() {
                 match cmd {
                     AudioCommand::UpdateListener { pos, fwd, up, category_volumes, engine_flags } => {
-                        state.listener_pos = pos; state.category_volumes = category_volumes; state.engine_flags = engine_flags;
-                        let mut inputs: crate::steam_audio::IPLSimulationSharedInputs = unsafe { std::mem::zeroed() };
-                        inputs.listener.origin = crate::steam_audio::IPLVector3 { x: pos[0], y: pos[1], z: pos[2] };
-                        inputs.listener.ahead = crate::steam_audio::IPLVector3 { x: fwd[0], y: fwd[1], z: fwd[2] };
-                        inputs.listener.up = crate::steam_audio::IPLVector3 { x: up[0], y: up[1], z: up[2] };
-                        inputs.listener.right = crate::steam_audio::IPLVector3 {
-                            x: up[1]*fwd[2] - up[2]*fwd[1], y: up[2]*fwd[0] - up[0]*fwd[2], z: up[0]*fwd[1] - up[1]*fwd[0],
-                        };
-                        unsafe {
-                            let _guard = app_state.simulator_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                            crate::steam_audio::iplSimulatorSetSharedInputs(
-                                app_state.simulator,
-                                crate::steam_audio::IPLSimulationFlags_IPL_SIMULATIONFLAGS_DIRECT | crate::steam_audio::IPLSimulationFlags_IPL_SIMULATIONFLAGS_REFLECTIONS,
-                                &mut inputs
-                            );
-                            crate::steam_audio::iplSimulatorCommit(app_state.simulator);
-                        }
+                        state.listener_pos = pos;
+                        state.listener_fwd = fwd;
+                        state.listener_up = up;
+                        state.category_volumes = category_volumes;
+                        state.engine_flags = engine_flags;
                     }
                     AudioCommand::PlaySound { uid, pos, volume, pitch, asset_hash, is_relative, is_spatial, category_id, direct_effect, binaural_effect, ipl_source } => {
                         if let Some(cached) = state.asset_cache.get(&asset_hash) {
@@ -93,11 +84,38 @@ pub fn run_audio_thread(device: cpal::Device, config: cpal::SupportedStreamConfi
                     AudioCommand::PlayStream { uid, pos, volume, pitch, is_relative, is_spatial, category_id, sample_rate, channels, direct_effect, binaural_effect, ipl_source } => {
                         let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
                         state.stream_senders.insert(uid, tx);
-                        state.active_sounds.push(ActiveSound { uid, source: AudioSource::Stream { rx, buffer: Vec::new(), cursor: 0.0 }, volume, pitch_step: pitch * (sample_rate as f32 / 48000.0f32), channels, pos, is_relative, is_spatial, category_id, direct_effect, binaural_effect, ipl_source });
+                        state.active_sounds.push(ActiveSound { uid, source: AudioSource::Stream { rx, buffer: Vec::new(), cursor: 0.0, underflow_frames: 0, is_buffering: true }, volume, pitch_step: pitch * (sample_rate as f32 / 48000.0f32), channels, pos, is_relative, is_spatial, category_id, direct_effect, binaural_effect, ipl_source });
                     }
                     AudioCommand::QueueStreamData { uid, samples } => { if let Some(tx) = state.stream_senders.get(&uid) { let _ = tx.send(samples); } }
                     AudioCommand::StopSound { uid } => { state.active_sounds.retain(|s| s.uid != uid); state.pending_sounds.retain(|s| s.uid != uid); state.stream_senders.remove(&uid); }
                     AudioCommand::StopAllSounds => { state.active_sounds.clear(); state.pending_sounds.clear(); state.stream_senders.clear(); }
+                    AudioCommand::UpdateSoundPosition { uid, pos } => {
+                        if let Some(sound) = state.active_sounds.iter_mut().find(|s| s.uid == uid) {
+                            sound.pos = pos;
+                            if let Some(ipl_src) = &sound.ipl_source {
+                                if !ipl_src.source.is_null() {
+                                    let mut source_inputs: crate::steam_audio::IPLSimulationInputs = unsafe { std::mem::zeroed() };
+                                    source_inputs.flags = crate::steam_audio::IPLSimulationFlags_IPL_SIMULATIONFLAGS_DIRECT | crate::steam_audio::IPLSimulationFlags_IPL_SIMULATIONFLAGS_REFLECTIONS;
+                                    source_inputs.directFlags = crate::steam_audio::IPLDirectSimulationFlags_IPL_DIRECTSIMULATIONFLAGS_OCCLUSION | crate::steam_audio::IPLDirectSimulationFlags_IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION;
+                                    source_inputs.source.origin = crate::steam_audio::IPLVector3 { x: pos[0], y: pos[1], z: pos[2] };
+                                    source_inputs.source.right = crate::steam_audio::IPLVector3 { x: 1.0, y: 0.0, z: 0.0 };
+                                    source_inputs.source.up = crate::steam_audio::IPLVector3 { x: 0.0, y: 1.0, z: 0.0 };
+                                    source_inputs.source.ahead = crate::steam_audio::IPLVector3 { x: 0.0, y: 0.0, z: 1.0 };
+                                    source_inputs.distanceAttenuationModel.type_ = crate::steam_audio::IPLDistanceAttenuationModelType_IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
+                                    source_inputs.distanceAttenuationModel.minDistance = 1.0;
+
+                                    unsafe {
+                                        let _guard = app_state.simulator_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                                        crate::steam_audio::iplSourceSetInputs(ipl_src.source, crate::steam_audio::IPLSimulationFlags_IPL_SIMULATIONFLAGS_DIRECT | crate::steam_audio::IPLSimulationFlags_IPL_SIMULATIONFLAGS_REFLECTIONS, &mut source_inputs);
+                                        crate::steam_audio::iplSimulatorCommit(app_state.simulator);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(sound) = state.pending_sounds.iter_mut().find(|s| s.uid == uid) {
+                            sound.pos = pos;
+                        }
+                    }
                     AudioCommand::ChangeDevice { .. } => {}
                 }
             }
@@ -112,6 +130,13 @@ pub fn run_audio_thread(device: cpal::Device, config: cpal::SupportedStreamConfi
                 while i < state.active_sounds.len() {
                     let sound = &mut state.active_sounds[i];
                     let mut finished = false;
+
+                    // Pause Bypass: If paused (bit 0 set), freeze playback position for everything except MUSIC (category_id 1)
+                    if (state.engine_flags & (1 << 0)) != 0 && sound.category_id != 1 {
+                        i += 1;
+                        continue;
+                    }
+
                     let mut sound_frame_mono = [0.0f32; FRAME_SIZE];
                     let mut sound_frame_l = [0.0f32; FRAME_SIZE];
                     let mut sound_frame_r = [0.0f32; FRAME_SIZE];
@@ -131,31 +156,113 @@ pub fn run_audio_thread(device: cpal::Device, config: cpal::SupportedStreamConfi
                             }
                             if !finished { *cursor += FRAME_SIZE as f32 * sound.pitch_step; }
                         }
-                        AudioSource::Stream { rx, buffer, cursor } => {
+                        AudioSource::Stream { rx, buffer, cursor, underflow_frames, is_buffering } => {
                             while let Ok(mut chunk) = rx.try_recv() { buffer.append(&mut chunk); }
 
-                            // CRITICAL FIX: Safe float math limits
-                            if buffer.len() > MAX_STREAM_BUFFER {
-                                let excess = buffer.len() - MAX_STREAM_BUFFER;
-                                buffer.drain(0..excess);
-                                *cursor = (*cursor - excess as f32).max(0.0);
+                            let channels = sound.channels as usize;
+
+                            // Jitter buffer auto-catchup. Cap latency around 85ms.
+                            let max_live_samples = 4096 * channels;
+                            if buffer.len() > max_live_samples {
+                                let excess = buffer.len() - max_live_samples;
+                                let excess_aligned = (excess / channels) * channels;
+                                if excess_aligned > 0 {
+                                    buffer.drain(0..excess_aligned);
+                                    *cursor = (*cursor - (excess_aligned / channels) as f32).max(0.0);
+                                }
                             }
 
-                            for f in 0..FRAME_SIZE {
-                                let next_pos = *cursor + f as f32 * sound.pitch_step;
-                                let idx = next_pos as usize;
-                                let t = next_pos - idx as f32;
-                                let val = if idx + 1 < buffer.len() { buffer[idx] * (1.0 - t) + buffer[idx + 1] * t } else if idx < buffer.len() { buffer[idx] } else { 0.0 };
-                                sound_frame_mono[f] = val; sound_frame_l[f] = val; sound_frame_r[f] = val;
+                            let available_frames = buffer.len() / channels;
+                            let needed_frames = (FRAME_SIZE as f32 * sound.pitch_step).ceil() as usize;
+
+                            // Pre-roll safety cushion frame count (approx 42ms of latency)
+                            const PRE_ROLL_FRAMES: usize = 2048;
+
+                            if *is_buffering {
+                                if available_frames >= PRE_ROLL_FRAMES {
+                                    *is_buffering = false;
+                                    *underflow_frames = 0;
+                                } else {
+                                    sound_frame_mono.fill(0.0);
+                                    sound_frame_l.fill(0.0);
+                                    sound_frame_r.fill(0.0);
+                                    *cursor = 0.0;
+                                }
                             }
-                            *cursor += FRAME_SIZE as f32 * sound.pitch_step;
-                            if *cursor > buffer.len() as f32 { *cursor = buffer.len() as f32; }
-                            let consumed_idx = *cursor as usize;
-                            if consumed_idx > 0 { let safe_drain = consumed_idx.min(buffer.len()); buffer.drain(0..safe_drain); *cursor -= safe_drain as f32; }
+
+                            if !*is_buffering {
+                                if available_frames < needed_frames {
+                                    *is_buffering = true;
+                                    *cursor = 0.0;
+                                    *underflow_frames += 1;
+
+                                    sound_frame_mono.fill(0.0);
+                                    sound_frame_l.fill(0.0);
+                                    sound_frame_r.fill(0.0);
+
+                                    if *underflow_frames > 468 {
+                                        finished = true;
+                                    }
+                                } else {
+                                    *underflow_frames = 0;
+
+                                    for f in 0..FRAME_SIZE {
+                                        let next_pos = *cursor + f as f32 * sound.pitch_step;
+                                        let idx = next_pos as usize;
+                                        let t = next_pos - idx as f32;
+
+                                        if channels == 1 {
+                                            let val = if idx + 1 < available_frames {
+                                                buffer[idx] * (1.0 - t) + buffer[idx + 1] * t
+                                            } else if idx < available_frames {
+                                                buffer[idx]
+                                            } else {
+                                                0.0
+                                            };
+                                            sound_frame_mono[f] = val;
+                                            sound_frame_l[f] = val;
+                                            sound_frame_r[f] = val;
+                                        } else {
+                                            let l_val = if idx + 1 < available_frames {
+                                                buffer[idx * 2] * (1.0 - t) + buffer[(idx + 1) * 2] * t
+                                            } else if idx < available_frames {
+                                                buffer[idx * 2]
+                                            } else {
+                                                0.0
+                                            };
+
+                                            let r_val = if idx + 1 < available_frames {
+                                                buffer[idx * 2 + 1] * (1.0 - t) + buffer[(idx + 1) * 2 + 1] * t
+                                            } else if idx < available_frames {
+                                                buffer[idx * 2 + 1]
+                                            } else {
+                                                0.0
+                                            };
+
+                                            sound_frame_l[f] = l_val;
+                                            sound_frame_r[f] = r_val;
+                                            sound_frame_mono[f] = (l_val + r_val) * 0.5;
+                                        }
+                                    }
+                                    *cursor += FRAME_SIZE as f32 * sound.pitch_step;
+
+                                    let consumed_idx = *cursor as usize;
+                                    if consumed_idx > 0 {
+                                        let safe_drain_frames = consumed_idx.min(available_frames);
+                                        let safe_drain_samples = safe_drain_frames * channels;
+                                        buffer.drain(0..safe_drain_samples);
+                                        *cursor -= safe_drain_frames as f32;
+                                    }
+                                }
+                            }
                         }
                     }
 
-                    if finished { state.active_sounds.remove(i); continue; }
+                    if finished {
+                        state.stream_senders.remove(&sound.uid);
+                        state.active_sounds.remove(i);
+                        continue;
+                    }
 
                     if sound.is_relative || !sound.is_spatial || (state.engine_flags & (1 << 1)) == 0 {
                         let mut pan = 0.5; let mut att = 1.0;
@@ -192,13 +299,14 @@ pub fn run_audio_thread(device: cpal::Device, config: cpal::SupportedStreamConfi
                         let mut spatialized_l = [0.0f32; FRAME_SIZE];
                         let mut spatialized_r = [0.0f32; FRAME_SIZE];
 
-                        // CRITICAL FIX: Normalize direction vector to prevent HRTF division-by-zero segfaults
-                        let mut d_vec = [sound.pos[0] - state.listener_pos[0], sound.pos[1] - state.listener_pos[1], sound.pos[2] - state.listener_pos[2]];
-                        let dist = (d_vec[0]*d_vec[0] + d_vec[1]*d_vec[1] + d_vec[2]*d_vec[2]).sqrt();
-                        let direction = if dist > 0.001 {
-                            crate::steam_audio::IPLVector3 { x: d_vec[0] / dist, y: d_vec[1] / dist, z: d_vec[2] / dist }
-                        } else {
-                            crate::steam_audio::IPLVector3 { x: 0.0, y: 0.0, z: 1.0 } // Safe fallback forward vector
+                        let direction = unsafe {
+                            crate::steam_audio::iplCalculateRelativeDirection(
+                                app_state.context,
+                                crate::steam_audio::IPLVector3 { x: sound.pos[0], y: sound.pos[1], z: sound.pos[2] },
+                                crate::steam_audio::IPLVector3 { x: state.listener_pos[0], y: state.listener_pos[1], z: state.listener_pos[2] },
+                                crate::steam_audio::IPLVector3 { x: state.listener_fwd[0], y: state.listener_fwd[1], z: state.listener_fwd[2] },
+                                crate::steam_audio::IPLVector3 { x: state.listener_up[0], y: state.listener_up[1], z: state.listener_up[2] },
+                            )
                         };
 
                         if let Some(binaural) = &mut sound.binaural_effect {

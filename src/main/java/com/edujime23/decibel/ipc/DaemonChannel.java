@@ -7,9 +7,13 @@ import java.net.UnixDomainSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 
 public class DaemonChannel {
+    // CRITICAL FIX: Global write lock to synchronize across ALL instances of DaemonChannel in the JVM
+    private static final Object globalWriteLock = new Object();
+
     private final boolean isWindows;
     private final Path socketPath;
     private final String pipePath = "\\\\.\\pipe\\decibel_engine";
@@ -57,80 +61,86 @@ public class DaemonChannel {
         Decibel.LOGGER.info("Successfully connected to Native Signal Channel.");
     }
 
-    public synchronized void sendAsset(int assetHash, byte[] rawOggBytes) {
-        try {
-            ByteBuffer header = ByteBuffer.allocate(13);
-            header.order(ByteOrder.LITTLE_ENDIAN);
-            header.put("DCBL".getBytes());
-            header.put((byte) 0x01);
-            header.putInt(assetHash);
-            header.putInt(rawOggBytes.length);
+    public void sendAsset(int assetHash, byte[] rawOggBytes) {
+        synchronized (globalWriteLock) {
+            try {
+                // CRITICAL FIX: Single buffer allocation for header + payload to guarantee write atomicity
+                ByteBuffer packet = ByteBuffer.allocate(13 + rawOggBytes.length);
+                packet.order(ByteOrder.LITTLE_ENDIAN);
+                packet.put("DCBL".getBytes(StandardCharsets.US_ASCII)); // Fixed platform-drift charset
+                packet.put((byte) 0x01);
+                packet.putInt(assetHash);
+                packet.putInt(rawOggBytes.length);
+                packet.put(rawOggBytes);
 
-            if (isWindows) {
-                windowsPipe.write(header.array());
-                windowsPipe.write(rawOggBytes);
-            } else {
-                unixSocket.write(ByteBuffer.wrap(header.array()));
-                unixSocket.write(ByteBuffer.wrap(rawOggBytes));
+                if (isWindows) {
+                    windowsPipe.write(packet.array());
+                } else {
+                    unixSocket.write(ByteBuffer.wrap(packet.array()));
+                }
+            } catch (Exception e) {
+                Decibel.LOGGER.error("Failed to send asset over Native Signal Channel", e);
             }
-        } catch (Exception e) {
-            Decibel.LOGGER.error("Failed to send asset over Native Signal Channel", e);
         }
     }
 
-    public synchronized void sendPlayStream(int uid, float x, float y, float z, float volume, float pitch, boolean relative, boolean spatial, int categoryId, int sampleRate, int channels) {
-        try {
-            int payloadSize = 28;
-            ByteBuffer packet = ByteBuffer.allocate(13 + payloadSize);
-            packet.order(ByteOrder.LITTLE_ENDIAN);
-            packet.put("DCBL".getBytes());
-            packet.put((byte) 0x02); // OP_PLAY_STREAM
-            packet.putInt(uid);
-            packet.putInt(payloadSize);
+    public void sendPlayStream(int uid, float x, float y, float z, float volume, float pitch, boolean relative, boolean spatial, int categoryId, int sampleRate, int channels) {
+        synchronized (globalWriteLock) {
+            try {
+                int payloadSize = 28;
+                ByteBuffer packet = ByteBuffer.allocate(13 + payloadSize);
+                packet.order(ByteOrder.LITTLE_ENDIAN);
+                packet.put("DCBL".getBytes(StandardCharsets.US_ASCII)); // Fixed platform-drift charset
+                packet.put((byte) 0x02); // OP_PLAY_STREAM
+                packet.putInt(uid);
+                packet.putInt(payloadSize);
 
-            packet.putFloat(x);
-            packet.putFloat(y);
-            packet.putFloat(z);
-            packet.putFloat(volume);
-            packet.putFloat(pitch);
-            packet.put((byte) (relative ? 1 : 0));
-            packet.put((byte) (spatial ? 1 : 0));
-            packet.put((byte) categoryId);
+                packet.putFloat(x);
+                packet.putFloat(y);
+                packet.putFloat(z);
+                packet.putFloat(volume);
+                packet.putFloat(pitch);
+                packet.put((byte) (relative ? 1 : 0));
+                packet.put((byte) (spatial ? 1 : 0));
+                packet.put((byte) categoryId);
 
-            packet.putInt(sampleRate);
-            packet.put((byte) channels);
+                packet.putInt(sampleRate);
+                packet.put((byte) channels);
 
-            if (isWindows) {
-                windowsPipe.write(packet.array());
-            } else {
-                unixSocket.write(ByteBuffer.wrap(packet.array()));
+                if (isWindows) {
+                    windowsPipe.write(packet.array());
+                } else {
+                    unixSocket.write(ByteBuffer.wrap(packet.array()));
+                }
+            } catch (Exception e) {
+                Decibel.LOGGER.error("Failed to send play stream command over Native Signal Channel", e);
             }
-        } catch (Exception e) {
-            Decibel.LOGGER.error("Failed to send play stream command over Native Signal Channel", e);
         }
     }
 
-    public synchronized void sendStreamData(int uid, float[] samples) {
-        try {
-            int payloadSize = samples.length * 4;
-            ByteBuffer packet = ByteBuffer.allocate(13 + payloadSize);
-            packet.order(ByteOrder.LITTLE_ENDIAN);
-            packet.put("DCBL".getBytes());
-            packet.put((byte) 0x03); // OP_STREAM_DATA
-            packet.putInt(uid);
-            packet.putInt(payloadSize);
+    public void sendStreamData(int uid, float[] samples) {
+        synchronized (globalWriteLock) {
+            try {
+                int payloadSize = samples.length * 4;
+                ByteBuffer packet = ByteBuffer.allocate(13 + payloadSize);
+                packet.order(ByteOrder.LITTLE_ENDIAN);
+                packet.put("DCBL".getBytes(StandardCharsets.US_ASCII)); // Fixed platform-drift charset
+                packet.put((byte) 0x03); // OP_STREAM_DATA
+                packet.putInt(uid);
+                packet.putInt(payloadSize);
 
-            for (float sample : samples) {
-                packet.putFloat(sample);
-            }
+                for (float sample : samples) {
+                    packet.putFloat(sample);
+                }
 
-            if (isWindows) {
-                windowsPipe.write(packet.array());
-            } else {
-                unixSocket.write(ByteBuffer.wrap(packet.array()));
+                if (isWindows) {
+                    windowsPipe.write(packet.array());
+                } else {
+                    unixSocket.write(ByteBuffer.wrap(packet.array()));
+                }
+            } catch (Exception e) {
+                Decibel.LOGGER.error("Failed to send stream data packet over Native Signal Channel", e);
             }
-        } catch (Exception e) {
-            Decibel.LOGGER.error("Failed to send stream data packet over Native Signal Channel", e);
         }
     }
 

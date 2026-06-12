@@ -129,6 +129,25 @@ public class SharedMemoryRingBuffer {
         lastSentDevice = deviceName;
     }
 
+    public boolean writeUpdatePosEvent(int uid, float x, float y, float z) {
+        int seq = writeSequence.getAndIncrement();
+        int rustReadSeq = (int) INT_VIEW.getAcquire(buffer, OFFSET_RUST_READ_SEQ);
+        if (seq - rustReadSeq >= QUEUE_CAPACITY) return false;
+
+        int slotIndex = seq & (QUEUE_CAPACITY - 1);
+        int offset = HEADER_SIZE + (slotIndex * SLOT_SIZE);
+
+        INT_VIEW.setRelease(buffer, offset, OpCodes.OP_NONE);
+        INT_VIEW.setRelease(buffer, offset + 4, uid);
+        FLOAT_VIEW.setRelease(buffer, offset + 8, x);
+        FLOAT_VIEW.setRelease(buffer, offset + 12, y);
+        FLOAT_VIEW.setRelease(buffer, offset + 16, z);
+
+        INT_VIEW.setRelease(buffer, offset, OpCodes.OP_UPDATE_POS); // Opcode 3
+        INT_VIEW.setRelease(buffer, OFFSET_JAVA_WRITE_SEQ, seq + 1);
+        return true;
+    }
+
     public boolean writePlayEvent(int uid, float x, float y, float z, float volume, float pitch, int assetHash, boolean relative, boolean spatial, int categoryId) {
         int seq = writeSequence.getAndIncrement();
         int rustReadSeq = (int) INT_VIEW.getAcquire(buffer, OFFSET_RUST_READ_SEQ);

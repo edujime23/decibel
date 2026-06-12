@@ -49,7 +49,6 @@ pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Se
     let shm_file_path = Path::new(&shm_path);
     let _tmp_dir = shm_file_path.parent().unwrap();
 
-    // CRITICAL FIX: Ensure Java has fully expanded the file size before memory mapping, or reading pointers will segfault
     let mut mmap = loop {
         if let Ok(file) = OpenOptions::new().read(true).write(true).open(shm_file_path) {
             if let Ok(metadata) = file.metadata() {
@@ -145,6 +144,27 @@ pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Se
         if ver == unsafe { read_volatile_u32(&mmap, OFFSET_VER) } {
             if listener_pos != last_pos || listener_fwd != last_fwd || listener_up != last_up || category_volumes != last_category_volumes || engine_flags != last_engine_flags {
                 let _ = tx_cmd.send(AudioCommand::UpdateListener { pos: listener_pos, fwd: listener_fwd, up: listener_up, category_volumes, engine_flags });
+
+                let mut inputs: crate::steam_audio::IPLSimulationSharedInputs = unsafe { std::mem::zeroed() };
+                inputs.listener.origin = crate::steam_audio::IPLVector3 { x: listener_pos[0], y: listener_pos[1], z: listener_pos[2] };
+                inputs.listener.ahead = crate::steam_audio::IPLVector3 { x: listener_fwd[0], y: listener_fwd[1], z: listener_fwd[2] };
+                inputs.listener.up = crate::steam_audio::IPLVector3 { x: listener_up[0], y: listener_up[1], z: listener_up[2] };
+                inputs.listener.right = crate::steam_audio::IPLVector3 {
+                    x: listener_up[1]*listener_fwd[2] - listener_up[2]*listener_fwd[1],
+                    y: listener_up[2]*listener_fwd[0] - listener_up[0]*listener_fwd[2],
+                    z: listener_up[0]*listener_fwd[1] - listener_up[1]*listener_fwd[0],
+                };
+
+                unsafe {
+                    let _guard = app_state.simulator_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    crate::steam_audio::iplSimulatorSetSharedInputs(
+                        app_state.simulator,
+                        crate::steam_audio::IPLSimulationFlags_IPL_SIMULATIONFLAGS_DIRECT | crate::steam_audio::IPLSimulationFlags_IPL_SIMULATIONFLAGS_REFLECTIONS,
+                        &mut inputs
+                    );
+                    crate::steam_audio::iplSimulatorCommit(app_state.simulator);
+                }
+
                 last_pos = listener_pos; last_fwd = listener_fwd; last_up = listener_up; last_category_volumes = category_volumes; last_engine_flags = engine_flags;
             }
         }
@@ -174,8 +194,8 @@ pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Se
 
         while local_read_seq < java_write_seq {
             let slot_index = (local_read_seq as usize) % QUEUE_CAPACITY;
-            let offset = HEADER_SIZE + (slot_index * SLOT_SIZE);
-            let opcode = unsafe { read_volatile_u32(&mmap, offset) };
+                let offset = HEADER_SIZE + (slot_index * SLOT_SIZE);
+                let opcode = unsafe { read_volatile_u32(&mmap, offset) };
 
             if opcode == 255 { break; }
 
@@ -210,18 +230,24 @@ pub async fn run_ipc_loop(shm_path: String, app_state: Arc<AppState>, tx_cmd: Se
                     direct_effect, binaural_effect, ipl_source
                 });
             } else if opcode == 1 {
-                let uid = unsafe { read_volatile_u32(&mmap, offset + 4) };
-                let _ = tx_cmd.send(AudioCommand::StopSound { uid });
-            } else if opcode == 2 {
-                let _ = tx_cmd.send(AudioCommand::StopAllSounds);
-            }
+                    let uid = unsafe { read_volatile_u32(&mmap, offset + 4) };
+                    let _ = tx_cmd.send(AudioCommand::StopSound { uid });
+                } else if opcode == 2 {
+                    let _ = tx_cmd.send(AudioCommand::StopAllSounds);
+                } else if opcode == 3 {
+                    // FIX: Handle real-time coordinates update event from Shared Memory
+                    let uid = unsafe { read_volatile_u32(&mmap, offset + 4) };
+                    let x = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(offset + 8) as *const f32) };
+                    let y = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(offset + 12) as *const f32) };
+                    let z = unsafe { std::ptr::read_volatile(mmap.as_ptr().add(offset + 16) as *const f32) };
 
-            local_read_seq += 1;
-            unsafe { write_volatile_u32(&mut mmap, OFFSET_RUST_READ_SEQ, local_read_seq) };
+                    let _ = tx_cmd.send(AudioCommand::UpdateSoundPosition { uid, pos: [x, y, z] });
+                }
+
+                local_read_seq += 1;
+                unsafe { write_volatile_u32(&mut mmap, OFFSET_RUST_READ_SEQ, local_read_seq) };
         }
 
-        // Only run the simulation thread if a world scene has been successfully committed.
-        // This prevents access violations when booting up, on the main menu, or during world loads.
         if last_sim_time.elapsed().as_millis() > 16 {
             let has_scene = app_state.current_scene.lock().unwrap().is_some();
             if has_scene {

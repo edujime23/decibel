@@ -10,6 +10,8 @@ pub enum AudioSource {
         rx: crossbeam_channel::Receiver<Vec<f32>>,
         buffer: Vec<f32>,
         cursor: f32,
+        underflow_frames: usize,
+        is_buffering: bool, // Track if we are currently building up a safety pre-roll cushion
     },
 }
 

@@ -6,7 +6,8 @@ use crate::AppState;
 use crate::audio::AudioCommand;
 use crate::asset;
 
-const MAX_PAYLOAD_SIZE: usize = 10485760;
+// FIX: Raised limit to 128MB to safely support large background music, ambient loops, and custom music discs
+const MAX_PAYLOAD_SIZE: usize = 134217728;
 
 pub async fn handle_client_stream<S>(mut stream: S, app_state: Arc<AppState>, tx_cmd: Sender<AudioCommand>)
 where S: AsyncReadExt + Unpin {
@@ -33,9 +34,8 @@ where S: AsyncReadExt + Unpin {
                     let payload_size = LittleEndian::read_u32(&pending_data[9..13]) as usize;
 
                     if payload_size > MAX_PAYLOAD_SIZE {
-                        eprintln!("[Rust Daemon] Security check: Payload exceeds max size. Dropping packet.");
-                        pending_data.drain(0..13);
-                        continue;
+                        eprintln!("[Rust Daemon] Security check: Payload size ({:.2} MB) exceeds limits. Stream is corrupted or too large. Closing socket.", payload_size as f32 / 1024.0 / 1024.0);
+                        return;
                     }
 
                     if pending_data.len() < 13 + payload_size { break; }

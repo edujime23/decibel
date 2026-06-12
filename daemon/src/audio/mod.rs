@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod source;
+pub mod reverb;
 
 use crate::asset::PCMAsset;
 use crate::phonon::{SteamDirectEffect, SteamBinauralEffect, SteamSource};
@@ -16,6 +17,7 @@ pub enum AudioCommand {
         sample_rate: u32, channels: u16,
         direct_effect: Option<SteamDirectEffect>, binaural_effect: Option<SteamBinauralEffect>, ipl_source: Option<SteamSource>,
     },
+    UpdateSoundPosition { uid: u32, pos: [f32; 3] }, // Added
     QueueStreamData { uid: u32, samples: Vec<f32> },
     StopSound { uid: u32 },
     StopAllSounds,

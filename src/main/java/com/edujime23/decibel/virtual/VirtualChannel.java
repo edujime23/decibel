@@ -26,6 +26,11 @@ public class VirtualChannel {
     private AudioStream stream;
     private boolean isStream = false;
 
+    // --- STREAM FLOW CONTROL CLOCK ---
+    private long playTimeNs = 0;       // Accumulated active playing duration
+    private long lastTickNs = 0;       // Real system time stamp of our last update
+    private long actualFramesSent = 0; // Cumulative frames pushed to the native side
+
     public VirtualChannel() {
         this.uid = channelIdGenerator.incrementAndGet();
     }
@@ -68,6 +73,7 @@ public class VirtualChannel {
     public static void setLooping(Object channelRef, boolean looping) { get(channelRef).looping = looping; }
     public static void setRelative(Object channelRef, boolean relative) { get(channelRef).relative = relative; }
     public static void pumpBuffers(Object channelRef, int count) { get(channelRef).pumpBuffers(count); }
+
     public static void updateStream(Object channelRef) {
         VirtualChannel vc = activeChannels.get(channelRef);
         if (vc == null || !vc.playing || !vc.isStream) return;
@@ -77,6 +83,8 @@ public class VirtualChannel {
     public void attachBufferStream(AudioStream stream) {
         this.stream = stream;
         this.isStream = true;
+        this.playTimeNs = 0;
+        this.actualFramesSent = 0;
     }
 
     private void dispatchStreamPlay() {
@@ -94,12 +102,19 @@ public class VirtualChannel {
     }
 
     public void play() {
+        if (this.playing) return;
         this.playing = true;
+
+        // Reset ticker timeline anchor so we don't skew the delta
+        this.lastTickNs = System.nanoTime();
+
         dispatchStreamPlay();
     }
 
     public void stop() {
         this.playing = false;
+        this.playTimeNs = 0;
+        this.actualFramesSent = 0;
         if (DaemonManager.ipc != null) DaemonManager.ipc.writeStopEvent(uid);
     }
 
@@ -113,8 +128,8 @@ public class VirtualChannel {
         this.y = y;
         this.z = z;
         this.spatial = true;
-        if (this.playing) {
-            dispatchStreamPlay();
+        if (this.playing && DaemonManager.ipc != null) {
+            DaemonManager.ipc.writeUpdatePosEvent(uid, x, y, z);
         }
     }
 
@@ -124,12 +139,33 @@ public class VirtualChannel {
             AudioFormat format = stream.getFormat();
             if (format == null) return;
 
+            int sampleRate = (int) format.getSampleRate();
+            int channels = format.getChannels();
             int sampleSize = format.getSampleSizeInBits();
             boolean bigEndian = format.isBigEndian();
 
-            for (int i = 0; i < count; i++) {
-                ByteBuffer bytes = stream.read(8192);
-                if (bytes == null || !bytes.hasRemaining()) break;
+            // 1. Progress virtual playback clock
+            long now = System.nanoTime();
+            this.playTimeNs += (now - this.lastTickNs);
+            this.lastTickNs = now;
+
+            // 2. Map playhead frames to wall clock elapsed play duration
+            double elapsedSeconds = this.playTimeNs / 1_000_000_000.0;
+            double expectedFramesPlayed = elapsedSeconds * sampleRate;
+
+            // Safety cushion (4096 frames = ~85ms of jitter buffer safety)
+            double targetFramesSent = expectedFramesPlayed + 4096;
+
+            int loops = 0;
+            // 3. Regulate socket data flow strictly against target play cushion
+            while (this.actualFramesSent < targetFramesSent && loops < 16) {
+                loops++;
+
+                // Read in 2,048 byte blocks (exactly 512 stereo frames of 16-bit PCM)
+                ByteBuffer bytes = stream.read(2048);
+                if (bytes == null || !bytes.hasRemaining()) {
+                    break;
+                }
 
                 byte[] data = new byte[bytes.remaining()];
                 bytes.get(data);
@@ -138,7 +174,8 @@ public class VirtualChannel {
                 if (sampleSize == 8) {
                     floats = new float[data.length];
                     for (int idx = 0; idx < data.length; idx++) {
-                        floats[idx] = data[idx] / 128.0f;
+                        // Normalize unsigned 8-bit bias
+                        floats[idx] = ((data[idx] & 0xFF) - 128) / 128.0f;
                     }
                 } else {
                     floats = new float[data.length / 2];
@@ -151,11 +188,12 @@ public class VirtualChannel {
                 }
 
                 if (floats.length > 0) {
+                    int framesRead = floats.length / channels;
+                    this.actualFramesSent += framesRead;
                     DaemonManager.channel.sendStreamData(uid, floats);
                 }
             }
         } catch (Exception e) {
-            // Log once and suppress to avoid console spam lag
             this.playing = false;
             Decibel.LOGGER.error("Stream pump failed, disabling virtual channel stream", e);
         }
